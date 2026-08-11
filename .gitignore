@@ -41,3 +41,7 @@ dist/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Personal Codex CLI helpers
+codex.ps1
+retry-codex.ps1
