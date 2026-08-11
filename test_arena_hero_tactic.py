@@ -46,6 +46,7 @@ from arena_hero_strategy import (
     AGGRESS_DEFENDER_VANGUARDS,
     AGGRESS_CORE_REINFORCEMENT_ENEMY_COUNT,
     AGGRESS_RANGER_WATCH_OFFSETS,
+    AGGRESS_RESOURCE_TARGET_CORE_LEASH_DISTANCE,
     AGGRESS_RESOURCE_SWEEP_MAX_RADIUS,
     AGGRESS_TARGET_RANGERS,
     AGGRESS_TARGET_VANGUARDS,
@@ -55,7 +56,11 @@ from arena_hero_strategy import (
     BEACON_RESOURCE_SWEEP_INITIAL_RADIUS,
     BEACON_RESOURCE_SWEEP_MAX_RADIUS,
     BROWSER_RESOURCE_HINT_MAX_DISTANCE,
+    CORE_MIGRATION_CARGO_BACKLOG_LIMIT,
     CORE_MIGRATION_CARGO_SERVICE_RADIUS,
+    CORE_MIGRATION_HEAL_SERVICE_RADIUS,
+    CORE_MIGRATION_RECENT_ENEMY_HOLD_RADIUS,
+    POST_RECALL_SWEEP_ASSEMBLY_RADIUS,
     ASSAULT_SWEEP_MAX_RADIUS,
     ASSAULT_SWEEP_MIN_RADIUS,
     ASSAULT_SWEEP_PROFILE_VERSION,
@@ -155,6 +160,7 @@ VANGUARD_THREE_ID = UUID("00000000-0000-4000-8000-000000000014")
 VANGUARD_FOURTH_ID = UUID("00000000-0000-4000-8000-000000000016")
 ENEMY_CORE_ID = UUID("00000000-0000-4000-8000-000000000200")
 ENEMY_RANGER_ID = UUID("00000000-0000-4000-8000-000000000201")
+ENEMY_VANGUARD_ID = UUID("00000000-0000-4000-8000-000000000202")
 
 
 def core(
@@ -263,6 +269,22 @@ def enemy_ranger(
         position=position,
         hp=hp,
         unit_type=UnitType.RANGER,
+    )
+
+
+def enemy_vanguard(
+    position: tuple[int, int],
+    *,
+    hp: int = 4,
+    unit_id: UUID = ENEMY_VANGUARD_ID,
+) -> UnitView:
+    return UnitView(
+        kind="UNIT",
+        id=unit_id,
+        controlled=False,
+        position=position,
+        hp=hp,
+        unit_type=UnitType.VANGUARD,
     )
 
 
@@ -579,6 +601,113 @@ class BalancedTacticTests(unittest.TestCase):
         self.assertIsInstance(action, ShootAction)
         self.assertEqual(action.target_id, ENEMY_CORE_ID)
         self.assertEqual(action.expected_cell, (0, 3))
+
+    def test_ranger_target_priority_is_core_then_ranger_then_vanguard(self) -> None:
+        core_turn, _ = make_turn(
+            own_core=core((0, 0)),
+            units=(ranger((0, 0)),),
+            enemies=(
+                enemy_vanguard((3, 0)),
+                enemy_ranger((0, 3)),
+                enemy_core((3, 3)),
+            ),
+        )
+
+        SmartTactic(TacticMemory()).choose_actions(core_turn)
+
+        core_action = core_turn.plan.unit_actions[RANGER_ID]
+        self.assertIsInstance(core_action, ShootAction)
+        self.assertEqual(core_action.target_id, ENEMY_CORE_ID)
+
+        unit_turn, _ = make_turn(
+            own_core=core((0, 0)),
+            units=(ranger((0, 0)),),
+            enemies=(enemy_vanguard((3, 0)), enemy_ranger((0, 3))),
+        )
+
+        SmartTactic(TacticMemory()).choose_actions(unit_turn)
+
+        unit_action = unit_turn.plan.unit_actions[RANGER_ID]
+        self.assertIsInstance(unit_action, ShootAction)
+        self.assertEqual(unit_action.target_id, ENEMY_RANGER_ID)
+
+    def test_vanguard_sweep_prioritizes_core_over_ranger(self) -> None:
+        turn, _ = make_turn(
+            own_core=core((5, 5)),
+            units=(vanguard((0, 0)),),
+            enemies=(enemy_core((1, 0)), enemy_ranger((0, 1))),
+        )
+
+        SmartTactic(TacticMemory()).choose_actions(turn)
+
+        action = turn.plan.unit_actions[VANGUARD_ID]
+        self.assertIsInstance(action, SweepAction)
+        self.assertEqual(action.direction, Direction.RIGHT)
+
+    def test_combat_units_ignore_enemy_worker_by_default(self) -> None:
+        turn, _ = make_turn(
+            own_core=core((0, 0)),
+            units=(ranger((0, 0)), vanguard((1, 0))),
+            enemies=(enemy_worker((0, 1)),),
+        )
+
+        SmartTactic(TacticMemory()).choose_actions(turn)
+
+        self.assertNotIsInstance(
+            turn.plan.unit_actions.get(RANGER_ID),
+            ShootAction,
+        )
+        self.assertNotIsInstance(
+            turn.plan.unit_actions.get(VANGUARD_ID),
+            SweepAction,
+        )
+
+    def test_enemy_worker_is_attacked_when_it_blocks_only_route(self) -> None:
+        worker_id = UUID(int=0x8123)
+        memory = TacticMemory(mode=MODE_AGGRESS)
+        turn, _ = make_turn(
+            own_core=core((0, 0)),
+            units=(ranger((0, 0)),),
+            enemies=(enemy_worker((1, 0), unit_id=worker_id),),
+            obstacle_cells=((-1, 0), (0, -1), (0, 1)),
+            beacon=ChampionBeacon(position=(2, 0)),
+        )
+
+        summary = SmartTactic(memory).choose_actions(turn)
+
+        action = turn.plan.unit_actions[RANGER_ID]
+        self.assertIsInstance(action, ShootAction)
+        self.assertEqual(action.target_id, worker_id)
+        self.assertTrue(
+            any("enemy_worker_route_blockers count=1" in item for item in summary.decisions)
+        )
+
+    def test_single_attacker_advances_on_confirmed_stationary_enemy(self) -> None:
+        memory = TacticMemory(recall=True)
+        memory.raid_enemy_motion[str(ENEMY_RANGER_ID)] = RaidEnemyMotion(
+            position=(5, 0),
+            stationary_observations=1,
+            last_seen_tick=7,
+        )
+        turn, _ = make_turn(
+            tick=8,
+            own_core=core((0, 0)),
+            units=(ranger((0, 0)),),
+            enemies=(enemy_ranger((5, 0)),),
+        )
+
+        summary = SmartTactic(memory).choose_actions(turn)
+
+        action = turn.plan.unit_actions[RANGER_ID]
+        self.assertIsInstance(action, MoveAction)
+        self.assertEqual(action.direction, Direction.RIGHT)
+        self.assertEqual(
+            memory.current_routes[str(RANGER_ID)].reason,
+            "stationary_enemy_seek_firing",
+        )
+        self.assertTrue(
+            any("stationary_advance" in item for item in summary.decisions)
+        )
 
     def test_movement_planner_respects_two_entity_cell_capacity(self) -> None:
         turn, _ = make_turn(
@@ -910,7 +1039,7 @@ class BalancedTacticTests(unittest.TestCase):
 
         self.assertIsInstance(turn.plan.core_action, HealAction)
 
-    def test_core_keeps_replacement_reserve_when_defense_is_fully_staffed(
+    def test_core_continues_combat_growth_when_defense_is_fully_staffed(
         self,
     ) -> None:
         turn, _ = make_turn(
@@ -935,7 +1064,8 @@ class BalancedTacticTests(unittest.TestCase):
 
         SmartTactic(TacticMemory()).choose_actions(turn)
 
-        self.assertNotIsInstance(turn.plan.core_action, SpawnAction)
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.RANGER)
 
     def test_develop_mode_builds_beacon_expedition_before_worker_growth(
         self,
@@ -1953,6 +2083,150 @@ class BalancedTacticTests(unittest.TestCase):
             any("core logistics_hold" in item for item in summary.decisions)
         )
 
+    def test_beacon_core_moves_while_cargo_worker_is_five_cells_away(self) -> None:
+        memory = TacticMemory(mode=MODE_BEACON, beacon_target_distance=12)
+        turn, _ = make_turn(
+            tick=80,
+            own_core=core((0, 0)),
+            units=(
+                worker(WORKER_LOW, (5, 0), cargo=1),
+                vanguard((1, 0)),
+                ranger((1, 1)),
+            ),
+            beacon=ChampionBeacon(position=(40, 0)),
+        )
+
+        summary = SmartTactic(memory).choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.core_action, StartMoveAction)
+        self.assertFalse(
+            any("core logistics_hold" in item for item in summary.decisions)
+        )
+
+    def test_beacon_core_pauses_for_distant_cargo_backlog(self) -> None:
+        memory = TacticMemory(mode=MODE_BEACON, beacon_target_distance=12)
+        cargo_workers = (
+            worker(WORKER_LOW, (5, 0), cargo=1),
+            worker(WORKER_HIGH, (6, 0), cargo=1),
+            worker(WORKER_THIRD, (7, 0), cargo=1),
+            worker(WORKER_FOURTH, (8, 0), cargo=1),
+        )
+        self.assertEqual(
+            sum(unit.cargo or 0 for unit in cargo_workers),
+            CORE_MIGRATION_CARGO_BACKLOG_LIMIT,
+        )
+        turn, _ = make_turn(
+            tick=80,
+            own_core=core((0, 0)),
+            units=(*cargo_workers, vanguard((1, 0)), ranger((1, 1))),
+            beacon=ChampionBeacon(position=(40, 0)),
+        )
+
+        summary = SmartTactic(memory).choose_actions(turn)
+
+        self.assertIsNone(turn.plan.core_action)
+        self.assertTrue(
+            any("core logistics_backlog_hold" in item for item in summary.decisions)
+        )
+
+    def test_beacon_core_pauses_for_wounded_unit_inside_heal_service_radius(self) -> None:
+        memory = TacticMemory(mode=MODE_BEACON, beacon_target_distance=12)
+        turn, _ = make_turn(
+            tick=80,
+            own_core=core((0, 0)),
+            units=(
+                worker(WORKER_LOW, (8, 0)),
+                vanguard((1, 0)),
+                ranger((CORE_MIGRATION_HEAL_SERVICE_RADIUS, 0), hp=1),
+            ),
+            resources=1,
+            beacon=ChampionBeacon(position=(40, 0)),
+        )
+
+        summary = SmartTactic(memory).choose_actions(turn)
+
+        self.assertIsNone(turn.plan.core_action)
+        self.assertTrue(
+            any("core medical_hold" in item for item in summary.decisions)
+        )
+
+    def test_moving_core_cancels_for_recent_nearby_enemy_sighting(self) -> None:
+        target = (CORE_MIGRATION_RECENT_ENEMY_HOLD_RADIUS - 1, 0)
+        memory = TacticMemory(
+            mode=MODE_BEACON,
+            beacon_target_distance=12,
+            enemy_sightings={
+                str(ENEMY_RANGER_ID): EnemySighting(target, 79, False)
+            },
+        )
+        turn, _ = make_turn(
+            tick=80,
+            own_core=moving_core((0, 0)),
+            units=(vanguard((1, 0)), ranger((1, 1))),
+            beacon=ChampionBeacon(position=(40, 0)),
+        )
+
+        summary = SmartTactic(memory).choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.core_action, CancelMoveAction)
+        self.assertTrue(
+            any("recent_enemy_alert" in item for item in summary.decisions)
+        )
+
+    def test_post_recall_sweep_waits_for_large_formation_then_activates(self) -> None:
+        memory = TacticMemory(
+            mode=MODE_DEVELOP,
+            recall=True,
+            post_recall_sweep=True,
+        )
+        far = POST_RECALL_SWEEP_ASSEMBLY_RADIUS + 10
+        waiting_turn, _ = make_turn(
+            tick=80,
+            own_core=core((0, 0)),
+            units=(
+                vanguard((1, 0), VANGUARD_ID),
+                vanguard((2, 0), VANGUARD_TWO_ID),
+                vanguard((far, 0), VANGUARD_THREE_ID),
+                ranger((1, 1), RANGER_ID),
+                ranger((2, 1), RANGER_TWO_ID),
+                ranger((far, 1), RANGER_THREE_ID),
+            ),
+        )
+        tactic = SmartTactic(memory)
+
+        waiting_summary = tactic.choose_actions(waiting_turn)
+
+        self.assertTrue(memory.recall)
+        self.assertEqual(memory.mode, MODE_DEVELOP)
+        self.assertTrue(
+            any("post_recall_sweep_wait" in item for item in waiting_summary.decisions)
+        )
+
+        ready_turn, _ = make_turn(
+            tick=81,
+            own_core=core((0, 0)),
+            units=(
+                vanguard((1, 0), VANGUARD_ID),
+                vanguard((2, 0), VANGUARD_TWO_ID),
+                vanguard((3, 0), VANGUARD_THREE_ID),
+                ranger((1, 1), RANGER_ID),
+                ranger((2, 1), RANGER_TWO_ID),
+                ranger((3, 1), RANGER_THREE_ID),
+            ),
+        )
+
+        ready_summary = tactic.choose_actions(ready_turn)
+
+        self.assertFalse(memory.recall)
+        self.assertFalse(memory.post_recall_sweep)
+        self.assertEqual(memory.mode, MODE_AGGRESS)
+        self.assertTrue(
+            any(
+                "post_recall_sweep_activated" in item
+                for item in ready_summary.decisions
+            )
+        )
+
     def test_beacon_core_does_not_wait_for_spinning_cargo_worker(self) -> None:
         memory = TacticMemory(mode=MODE_BEACON, beacon_target_distance=12)
         radius = CORE_MIGRATION_CARGO_SERVICE_RADIUS
@@ -2063,6 +2337,7 @@ class BalancedTacticTests(unittest.TestCase):
             recovery_targets=[(11, 12)],
             recovery_checked={(13, 14)},
             temporary_blocks={(5, 6): 22},
+            worker_threat_recall_until={str(WORKER_LOW): 40},
             planned_moves={str(WORKER_LOW): PlannedMove((7, 8), 21)},
             unit_labels={str(WORKER_LOW): UnitLabel("WORKER", 4)},
             unit_label_counters={"WORKER": 4},
@@ -2082,6 +2357,7 @@ class BalancedTacticTests(unittest.TestCase):
             local_core_sortie_core_id=str(ENEMY_CORE_ID),
             local_core_sortie_position=(12, 0),
             local_core_sortie_started_tick=18,
+            local_core_sortie_retry_after_tick=30,
             local_core_sortie_vanguard_ids={str(VANGUARD_ID)},
             local_core_sortie_ranger_ids={str(RANGER_ID), str(RANGER_TWO_ID)},
             replacement_queue={"RANGER": 2},
@@ -2099,6 +2375,7 @@ class BalancedTacticTests(unittest.TestCase):
         self.assertEqual(restored.recovery_targets, [(11, 12)])
         self.assertEqual(restored.recovery_checked, {(13, 14)})
         self.assertEqual(restored.temporary_blocks[(5, 6)], 22)
+        self.assertEqual(restored.worker_threat_recall_until[str(WORKER_LOW)], 40)
         self.assertEqual(restored.visited[(9, 10)], 3)
         self.assertEqual(restored.planned_moves[str(WORKER_LOW)].destination, (7, 8))
         self.assertEqual(restored.unit_labels[str(WORKER_LOW)], UnitLabel("WORKER", 4))
@@ -2122,6 +2399,7 @@ class BalancedTacticTests(unittest.TestCase):
         self.assertEqual(restored.local_core_sortie_core_id, str(ENEMY_CORE_ID))
         self.assertEqual(restored.local_core_sortie_position, (12, 0))
         self.assertEqual(restored.local_core_sortie_started_tick, 18)
+        self.assertEqual(restored.local_core_sortie_retry_after_tick, 30)
         self.assertEqual(
             restored.local_core_sortie_vanguard_ids,
             {str(VANGUARD_ID)},
@@ -2131,6 +2409,38 @@ class BalancedTacticTests(unittest.TestCase):
             {str(RANGER_ID), str(RANGER_TWO_ID)},
         )
         self.assertEqual(restored.replacement_queue, {"RANGER": 2})
+
+    def test_worker_keeps_retreating_after_attacker_leaves_vision(self) -> None:
+        memory = TacticMemory(mode=MODE_BEACON)
+        threatened_turn, _ = make_turn(
+            tick=100,
+            own_core=core((0, 0)),
+            units=(worker(WORKER_LOW, (20, 0)),),
+            enemies=(enemy_ranger((21, 0)),),
+            beacon=ChampionBeacon(position=(100, 0)),
+        )
+
+        SmartTactic(memory).choose_actions(threatened_turn)
+
+        self.assertGreater(
+            memory.worker_threat_recall_until[str(WORKER_LOW)],
+            threatened_turn.tick,
+        )
+
+        hidden_turn, _ = make_turn(
+            tick=101,
+            own_core=core((0, 0)),
+            units=(worker(WORKER_LOW, (19, 0)),),
+            beacon=ChampionBeacon(position=(100, 0)),
+        )
+        summary = SmartTactic(memory).choose_actions(hidden_turn)
+
+        action = hidden_turn.plan.unit_actions[WORKER_LOW]
+        self.assertIsInstance(action, MoveAction)
+        self.assertEqual(action.direction, Direction.LEFT)
+        self.assertTrue(
+            any("reason=worker_threat_recall" in item for item in summary.decisions)
+        )
 
     def test_memory_load_merges_unchecked_recovery_hint_file(self) -> None:
         with TemporaryDirectory() as directory:
@@ -2372,6 +2682,54 @@ class BalancedTacticTests(unittest.TestCase):
         self.assertTrue(
             any("resource_leash_trim" in item for item in summary.decisions)
         )
+
+    def test_aggress_drops_far_visible_resource_after_core_migrates(self) -> None:
+        far_target = (0, -AGGRESS_RESOURCE_TARGET_CORE_LEASH_DISTANCE - 40)
+        memory = TacticMemory(
+            mode=MODE_AGGRESS,
+            worker_goals={
+                str(WORKER_LOW): WorkerGoal("visible_resource", far_target, 10),
+            },
+        )
+        turn, _ = make_turn(
+            tick=30,
+            own_core=core((0, 0)),
+            units=(worker(WORKER_LOW, (0, -50)),),
+            resource_cells=(far_target,),
+            resources=0,
+            beacon=ChampionBeacon(position=(100, 0)),
+        )
+
+        summary = SmartTactic(memory).choose_actions(turn)
+
+        goal = memory.worker_goals[str(WORKER_LOW)]
+        self.assertNotEqual(goal.position, far_target)
+        self.assertEqual(goal.kind, "resource_sweep")
+        self.assertLessEqual(
+            _distance(turn.core.position, goal.position),
+            AGGRESS_RESOURCE_SWEEP_MAX_RADIUS,
+        )
+        self.assertTrue(
+            any("resource_leash_trim" in item for item in summary.decisions)
+        )
+
+    def test_aggress_remote_worker_finishes_resource_already_in_reach(self) -> None:
+        far_target = (0, -AGGRESS_RESOURCE_TARGET_CORE_LEASH_DISTANCE - 40)
+        memory = TacticMemory(mode=MODE_AGGRESS)
+        turn, _ = make_turn(
+            tick=30,
+            own_core=core((0, 0)),
+            units=(worker(WORKER_LOW, (0, far_target[1] + 1)),),
+            resource_cells=(far_target,),
+            resources=0,
+            beacon=ChampionBeacon(position=(100, 0)),
+        )
+
+        SmartTactic(memory).choose_actions(turn)
+
+        goal = memory.worker_goals[str(WORKER_LOW)]
+        self.assertEqual(goal.kind, "visible_resource")
+        self.assertEqual(goal.position, far_target)
 
     def test_reached_frontier_goal_rotates_without_waiting_for_expiry(self) -> None:
         memory = TacticMemory(
@@ -3400,8 +3758,9 @@ class ModeAndRecallTests(unittest.TestCase):
                 enemies=(enemy_core((12, 0)),),
             )
 
+            memory = TacticMemory(mode=MODE_AGGRESS)
             summary = SmartTactic(
-                TacticMemory(mode=MODE_AGGRESS),
+                memory,
                 control_path=control_path,
             ).choose_actions(turn)
 
@@ -3496,7 +3855,7 @@ class ModeAndRecallTests(unittest.TestCase):
                 home_vanguards
                 + home_rangers
                 + (
-                    vanguard((8, 0), assault_vanguard),
+                    vanguard((14, 0), assault_vanguard),
                     ranger((8, 1), assault_ranger_one),
                     ranger((13, 0), assault_ranger_two),
                 )
@@ -3514,10 +3873,57 @@ class ModeAndRecallTests(unittest.TestCase):
         )
         action = ready_turn.plan.unit_actions[assault_ranger_two]
         self.assertIsInstance(action, ShootAction)
-        self.assertIsNone(action.target_id)
+        self.assertEqual(action.target_id, ENEMY_CORE_ID)
         self.assertEqual(action.expected_cell, (16, 0))
         self.assertTrue(
-            any("enemy_core_range3" in item for item in ready_summary.decisions)
+            any("role=enemy_core_priority" in item for item in ready_summary.decisions)
+        )
+
+    def test_core_assault_rangers_wait_for_vanguard_screen(self) -> None:
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, mode="aggress", recall=False)
+            home_vanguards = tuple(
+                vanguard((index, 1), UUID(int=0xA410 + index))
+                for index in range(AGGRESS_DEFENDER_VANGUARDS)
+            )
+            home_rangers = tuple(
+                ranger((index, 2), UUID(int=0xA420 + index))
+                for index in range(AGGRESS_DEFENDER_RANGERS)
+            )
+            assault_vanguard = UUID(int=0xA430)
+            firing_ranger = UUID(int=0xA431)
+            units = (
+                home_vanguards
+                + home_rangers
+                + (
+                    vanguard((8, 0), assault_vanguard),
+                    ranger((8, 1), UUID(int=0xA432)),
+                    ranger((13, 0), firing_ranger),
+                )
+            )
+            turn, _ = make_turn(
+                tick=232,
+                own_core=core((0, 0)),
+                units=units,
+                enemies=(
+                    enemy_core((16, 0)),
+                    enemy_ranger((16, 2), unit_id=UUID(int=0xA433)),
+                ),
+            )
+            memory = TacticMemory(mode=MODE_AGGRESS)
+            summary = SmartTactic(
+                memory,
+                control_path=control_path,
+            ).choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.unit_actions[firing_ranger], MoveAction)
+        self.assertEqual(
+            memory.current_routes[str(firing_ranger)].reason,
+            "enemy_core_await_screen",
+        )
+        self.assertTrue(
+            any("enemy_core_await_screen" in item for item in summary.decisions)
         )
 
     def test_nearby_known_core_builds_independent_breach_force_after_home_reserve(
@@ -5130,7 +5536,7 @@ class ModeAndRecallTests(unittest.TestCase):
             _core_logistics_corridor((0, 0), set(obstacles)),
         )
 
-    def test_recall_full_roster_does_not_vacate_for_idle_resources(self) -> None:
+    def test_recall_full_roster_vacates_for_continuous_growth(self) -> None:
         with TemporaryDirectory() as directory:
             control_path = Path(directory) / ".arena_hero_control.json"
             self._write_control(control_path, recall=True)
@@ -5158,15 +5564,17 @@ class ModeAndRecallTests(unittest.TestCase):
                 control_path=control_path,
             ).choose_actions(turn)
 
-        self.assertFalse(
+        self.assertTrue(
             any("vacate_core_for_logistics" in item for item in summary.decisions)
         )
-        self.assertFalse(
+        self.assertTrue(
             any(
                 route.reason == "vacate_core_for_logistics"
                 for route in memory.current_routes.values()
             )
         )
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.RANGER)
 
     def test_recall_production_prefers_defense(self) -> None:
         with TemporaryDirectory() as directory:
@@ -5929,6 +6337,58 @@ class StuckHealPredictionTests(unittest.TestCase):
             any("stuck_clear reason=spinning" in item for item in summary.decisions)
         )
 
+    def test_spinning_worker_does_not_immediately_retry_blocked_resource(self) -> None:
+        target = (10, 0)
+        memory = TacticMemory(
+            worker_goals={
+                str(WORKER_LOW): WorkerGoal("visible_resource", target, 0)
+            }
+        )
+        memory.recent_positions[str(WORKER_LOW)] = [
+            (3, 0),
+            (3, 1),
+        ] * (STUCK_TICKS // 2)
+        memory.unit_positions[str(WORKER_LOW)] = (3, 1)
+        memory.last_position_tick[str(WORKER_LOW)] = 5
+        turn, _ = make_turn(
+            tick=20,
+            own_core=core((0, 0)),
+            units=(worker(WORKER_LOW, (3, 1)),),
+            resource_cells=(target,),
+        )
+
+        summary = SmartTactic(memory).choose_actions(turn)
+
+        self.assertGreater(memory.temporary_blocks[target], turn.tick)
+        goal = memory.worker_goals.get(str(WORKER_LOW))
+        self.assertTrue(goal is None or goal.position != target)
+        self.assertTrue(
+            any("resource_temporarily_blocked" in item for item in summary.decisions)
+        )
+
+    def test_worker_abandons_resource_goal_blocked_on_previous_tick(self) -> None:
+        target = (10, 0)
+        memory = TacticMemory(
+            worker_goals={
+                str(WORKER_LOW): WorkerGoal("visible_resource", target, 19)
+            },
+            temporary_blocks={target: 30},
+        )
+        turn, _ = make_turn(
+            tick=20,
+            own_core=core((0, 0)),
+            units=(worker(WORKER_LOW, (3, 0)),),
+            resource_cells=(target,),
+        )
+
+        summary = SmartTactic(memory).choose_actions(turn)
+
+        goal = memory.worker_goals.get(str(WORKER_LOW))
+        self.assertTrue(goal is None or goal.position != target)
+        self.assertTrue(
+            any("resource_block_hold" in item for item in summary.decisions)
+        )
+
     def test_old_position_history_does_not_clear_fresh_goal(self) -> None:
         memory = TacticMemory()
         memory.worker_goals[str(WORKER_LOW)] = WorkerGoal(
@@ -6278,7 +6738,7 @@ class StuckHealPredictionTests(unittest.TestCase):
                 tick=100,
                 own_core=core((0, 0)),
                 units=units,
-                enemies=(enemy_core((35, 0)),),
+                enemies=(enemy_core((41, 0)),),
                 beacon=ChampionBeacon(position=(100, 0)),
             )
             memory = TacticMemory()
@@ -6286,7 +6746,7 @@ class StuckHealPredictionTests(unittest.TestCase):
 
         self.assertEqual(len(memory.local_core_sortie_vanguard_ids), 1)
         self.assertEqual(len(memory.local_core_sortie_ranger_ids), 2)
-        self.assertEqual(memory.local_core_sortie_position, (35, 0))
+        self.assertEqual(memory.local_core_sortie_position, (41, 0))
         local_routes = [
             route
             for route in memory.current_routes.values()
@@ -6333,6 +6793,78 @@ class StuckHealPredictionTests(unittest.TestCase):
                 route.reason.startswith("local_core_sortie_")
                 for route in memory.current_routes.values()
             )
+        )
+
+    def test_beacon_local_core_sortie_rejects_target_beyond_worker_screen(
+        self,
+    ) -> None:
+        units = (
+            vanguard((1, 0), VANGUARD_ID),
+            vanguard((-1, 0), VANGUARD_TWO_ID),
+            vanguard((0, 1), VANGUARD_THREE_ID),
+            ranger((0, -2), RANGER_ID),
+            ranger((2, 0), RANGER_TWO_ID),
+            ranger((-2, 0), RANGER_THREE_ID),
+        )
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, mode="beacon")
+            turn, _ = make_turn(
+                tick=100,
+                own_core=core((0, 0)),
+                units=units,
+                enemies=(enemy_core((45, 0)),),
+                beacon=ChampionBeacon(position=(100, 0)),
+            )
+            memory = TacticMemory()
+            SmartTactic(memory, control_path=control_path).choose_actions(turn)
+
+        self.assertIsNone(memory.local_core_sortie_core_id)
+
+    def test_beacon_local_core_sortie_does_not_restart_after_combat_cancel(
+        self,
+    ) -> None:
+        units = (
+            vanguard((20, 0), VANGUARD_ID),
+            vanguard((-1, 0), VANGUARD_TWO_ID),
+            vanguard((0, 1), VANGUARD_THREE_ID),
+            ranger((20, -1), RANGER_ID),
+            ranger((20, 1), RANGER_TWO_ID),
+            ranger((-2, 0), RANGER_THREE_ID),
+        )
+        memory = TacticMemory(
+            mode=MODE_BEACON,
+            enemy_sightings={
+                str(ENEMY_CORE_ID): EnemySighting((40, 0), 99, True)
+            },
+            local_core_sortie_core_id=str(ENEMY_CORE_ID),
+            local_core_sortie_position=(40, 0),
+            local_core_sortie_started_tick=98,
+            local_core_sortie_vanguard_ids={str(VANGUARD_ID)},
+            local_core_sortie_ranger_ids={str(RANGER_ID), str(RANGER_TWO_ID)},
+        )
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, mode="beacon")
+            turn, _ = make_turn(
+                tick=100,
+                own_core=core((0, 0)),
+                units=units,
+                enemies=(enemy_core((40, 0)), enemy_ranger((22, 0))),
+                beacon=ChampionBeacon(position=(100, 0)),
+            )
+            summary = SmartTactic(
+                memory,
+                control_path=control_path,
+            ).choose_actions(turn)
+
+        self.assertIsNone(memory.local_core_sortie_core_id)
+        self.assertGreater(memory.local_core_sortie_retry_after_tick, turn.tick)
+        self.assertTrue(
+            any("local_core_sortie_cancelled" in item for item in summary.decisions)
+        )
+        self.assertTrue(
+            any("local_core_sortie_cooldown" in item for item in summary.decisions)
         )
 
     def test_beacon_local_core_sortie_persists_through_short_visibility_gap(
@@ -7065,6 +7597,116 @@ class StuckHealPredictionTests(unittest.TestCase):
             SmartTactic(TacticMemory(), control_path=control_path).choose_actions(turn)
 
         self.assertEqual(len(turn.units), 19)
+        self.assertIsNone(turn.plan.core_action)
+
+    def test_beacon_mode_continues_growth_after_population_thirty(self) -> None:
+        units = tuple(
+            [
+                worker(UUID(int=0x7300 + index), (20 + index, 0))
+                for index in range(10)
+            ]
+            + [
+                vanguard((20 + index, 2), UUID(int=0x7400 + index))
+                for index in range(8)
+            ]
+            + [
+                ranger((20 + index, 4), UUID(int=0x7500 + index))
+                for index in range(12)
+            ]
+        )
+        turn, _ = make_turn(
+            own_core=core((0, 0)),
+            units=units,
+            resources=unit_cost(UnitType.RANGER, 30),
+            beacon=ChampionBeacon(position=(100, 0)),
+        )
+
+        SmartTactic(TacticMemory(mode=MODE_BEACON)).choose_actions(turn)
+
+        self.assertEqual(len(turn.units), 30)
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.RANGER)
+
+    def test_continuous_growth_uses_affordable_balanced_role(self) -> None:
+        units = tuple(
+            [
+                worker(UUID(int=0x7600 + index), (20 + index, 0))
+                for index in range(10)
+            ]
+            + [
+                vanguard((20 + index, 2), UUID(int=0x7700 + index))
+                for index in range(8)
+            ]
+            + [
+                ranger((20 + index, 4), UUID(int=0x7800 + index))
+                for index in range(12)
+            ]
+        )
+        turn, _ = make_turn(
+            own_core=core((0, 0)),
+            units=units,
+            resources=unit_cost(UnitType.VANGUARD, 30),
+            beacon=ChampionBeacon(position=(100, 0)),
+        )
+
+        SmartTactic(TacticMemory(mode=MODE_BEACON)).choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.VANGUARD)
+
+    def test_continuous_growth_uses_nearby_affordable_worker_role(self) -> None:
+        units = tuple(
+            [
+                worker(UUID(int=0x7900 + index), (20 + index, 0))
+                for index in range(12)
+            ]
+            + [
+                vanguard((20 + index, 2), UUID(int=0x7A00 + index))
+                for index in range(9)
+            ]
+            + [
+                ranger((20 + index, 4), UUID(int=0x7B00 + index))
+                for index in range(14)
+            ]
+        )
+        turn, _ = make_turn(
+            own_core=core((0, 0)),
+            units=units,
+            resources=unit_cost(UnitType.WORKER, len(units)),
+            beacon=ChampionBeacon(position=(100, 0)),
+        )
+
+        SmartTactic(TacticMemory(mode=MODE_BEACON)).choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.WORKER)
+
+    def test_continuous_growth_saves_when_affordable_role_is_overrepresented(
+        self,
+    ) -> None:
+        units = tuple(
+            [
+                worker(UUID(int=0x7C00 + index), (20 + index, 0))
+                for index in range(13)
+            ]
+            + [
+                vanguard((20 + index, 2), UUID(int=0x7D00 + index))
+                for index in range(9)
+            ]
+            + [
+                ranger((20 + index, 4), UUID(int=0x7E00 + index))
+                for index in range(14)
+            ]
+        )
+        turn, _ = make_turn(
+            own_core=core((0, 0)),
+            units=units,
+            resources=unit_cost(UnitType.WORKER, len(units)),
+            beacon=ChampionBeacon(position=(100, 0)),
+        )
+
+        SmartTactic(TacticMemory(mode=MODE_BEACON)).choose_actions(turn)
+
         self.assertIsNone(turn.plan.core_action)
 
 
