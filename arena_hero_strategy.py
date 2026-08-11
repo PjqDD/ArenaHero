@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 import json
+import math
 import os
 import time
 from collections import Counter
@@ -66,6 +67,16 @@ AGGRESS_BASE_WORKERS = 4
 # Recovery bridge: one extra worker beyond the four-worker baseline while the
 # six-slot home combat reserve is still incomplete.
 RECOVERY_BRIDGE_MAX_WORKERS = 7
+# After a Core loss, broad Beacon-mode sweeps make the first replacement army
+# take too long to finance.  Keep the temporary economy inside the Core's
+# highest-value nearby chunks until the fixed home screen is rebuilt.
+RECOVERY_RESOURCE_SWEEP_INITIAL_RADIUS = 8
+RECOVERY_RESOURCE_SWEEP_STEP = 6
+# 2026-08-11: 视野内无资源时允许工人持续外扩搜索（螺旋扫描），直到发现资源。
+# 原 20 在 core 周围资源荒漠时导致工人无限空转；160 可覆盖最近的真实富矿区（~536格
+# 外的 chunk(5,-6)），并配合 _frontier_target 的螺旋外扩逐圈推进。
+RECOVERY_RESOURCE_SWEEP_MAX_RADIUS = 160
+RECOVERY_RESOURCE_TARGET_CORE_LEASH_DISTANCE = 24
 AGGRESS_TARGET_VANGUARDS = 6
 AGGRESS_TARGET_RANGERS = 9
 # 编队距离：同类型组合 ≤ 此距离视为一队
@@ -116,7 +127,13 @@ POST_RECALL_SWEEP_READY_DENOMINATOR = 5
 # Low-resource development stays inside the Core's local 32x32 production
 # area and its nearest boundary. Longer one-way searches delay deposits and
 # army rebuilding more than the extra vision helps.
-DEVELOP_WIDE_SEARCH_MAX_RADIUS = 28
+# 2026-08-11: 视野内无资源时持续螺旋外扩。原 28 导致 core 周围荒漠时工人空转；
+# 160 让工人能逐圈推进到 160 格，触达最近真实富矿区。
+DEVELOP_WIDE_SEARCH_MAX_RADIUS = 160
+# 2026-08-11: develop_local_recall 的"当地范围"判定保持原 28（与探索半径解耦）。
+# 探索半径扩到 160 只用于工人找资源；超过 28 格的远处工人仍需召回 core，
+# 否则远处 worker 不会被拉回防守/卸货，破坏召回保护。
+DEVELOP_LOCAL_RECALL_RADIUS = 28
 # A visible resource can still be a poor economic target when it was revealed
 # by a distant scout.  Keep new Develop-mode assignments inside the same local
 # production radius unless a Worker is already close enough to finish it.
@@ -212,6 +229,13 @@ AGGRESS_RANGER_ALERT_OFFSETS = (
 )
 BEACON_GUARD_VANGUARDS = 2
 BEACON_GUARD_RANGERS = 3
+# A fixed 3+3 reserve is adequate for a small force but left only six of a
+# forty-Unit army at home during the last fatal Core rush.  Beacon mode keeps
+# at least half of each combat arm near the Core; the rest remains available
+# for the expedition.
+BEACON_HOME_RESERVE_NUMERATOR = 1
+BEACON_HOME_RESERVE_DENOMINATOR = 2
+BEACON_HOME_RESERVE_SCALE_MIN_COMBAT = 18
 # After the 5V+8R combat baseline is ready, grow a local economy before buying
 # the expensive 9th-12th Rangers and 6th-8th Vanguards. Ten Workers improve
 # refill discovery after nearby chunks are depleted, while two spare resources
@@ -529,6 +553,7 @@ class TacticMemory:
     last_core_damaged_tick: int = 0
     last_core_destroyed_tick: int = 0
     last_core_respawn_tick: int = 0
+    catastrophic_rebuild_pending: bool = False
     core_shelter_target: Position | None = None
     core_shelter_entrance: Position | None = None
     migration_candidate: Position | None = None
@@ -741,6 +766,12 @@ class TacticMemory:
                 data.get("last_core_destroyed_tick", 0)
             )
             memory.last_core_respawn_tick = int(data.get("last_core_respawn_tick", 0))
+            memory.catastrophic_rebuild_pending = bool(
+                data.get(
+                    "catastrophic_rebuild_pending",
+                    memory.last_core_destroyed_tick > 0,
+                )
+            )
             shelter_target = data.get("core_shelter_target")
             if isinstance(shelter_target, list) and len(shelter_target) == 2:
                 memory.core_shelter_target = (
@@ -1027,6 +1058,7 @@ class TacticMemory:
             "last_core_damaged_tick": self.last_core_damaged_tick,
             "last_core_destroyed_tick": self.last_core_destroyed_tick,
             "last_core_respawn_tick": self.last_core_respawn_tick,
+            "catastrophic_rebuild_pending": self.catastrophic_rebuild_pending,
             "core_shelter_target": (
                 list(self.core_shelter_target)
                 if self.core_shelter_target is not None
@@ -1313,11 +1345,13 @@ class TacticMemory:
             elif event.event_type == "CORE_DESTROYED":
                 self.last_core_damaged_tick = turn.tick
                 self.last_core_destroyed_tick = turn.tick
+                self.catastrophic_rebuild_pending = True
                 self.clear_core_shelter_memory()
                 self.core_heading = None
                 self.last_core_move_tick = 0
                 self.clear_raid_state()
                 self.clear_local_core_sortie()
+
             elif event.event_type == "CORE_RESPAWNED":
                 self.last_core_respawn_tick = turn.tick
                 self.clear_core_shelter_memory()
@@ -1440,6 +1474,16 @@ class TacticMemory:
                 and event.reason_code == "CORE"
             ):
                 self.enemy_cores_destroyed += 1
+
+        if (
+            self.catastrophic_rebuild_pending
+            and turn.core is not None
+            and len(turn.vanguards) >= RAID_HOME_RESERVE_VANGUARDS
+            and len(turn.rangers) >= RAID_HOME_RESERVE_RANGERS
+            and len(turn.vanguards) + len(turn.rangers)
+            >= RAID_HOME_RESERVE_COMBAT
+        ):
+            self.catastrophic_rebuild_pending = False
 
         if self.mode == MODE_AGGRESS and turn.core is not None:
             nearby_combat_enemies = sum(
@@ -3775,12 +3819,21 @@ class SmartTactic:
 
         if turn.beacon.status is BeaconStatus.GROUND:
             home_vanguards, home_rangers = self._beacon_home_reserve_ids(turn)
+            beacon_at_core = (
+                turn.core is not None
+                and turn.beacon.position == turn.core.position
+            )
             candidates = [
                 unit
                 for unit in turn.units
                 if unit.position == turn.beacon.position
-                and unit.id not in home_vanguards
-                and unit.id not in home_rangers
+                and (
+                    beacon_at_core
+                    or (
+                        unit.id not in home_vanguards
+                        and unit.id not in home_rangers
+                    )
+                )
             ]
             candidates.sort(
                 key=lambda unit: (
@@ -3848,7 +3901,11 @@ class SmartTactic:
         owns_beacon = _owns_beacon(turn)
         resource_target_core_leash = None
         if not owns_beacon:
-            if self.memory.mode == MODE_DEVELOP:
+            if self._catastrophic_rebuild_active(turn):
+                resource_target_core_leash = (
+                    RECOVERY_RESOURCE_TARGET_CORE_LEASH_DISTANCE
+                )
+            elif self.memory.mode == MODE_DEVELOP:
                 resource_target_core_leash = (
                     DEVELOP_RESOURCE_TARGET_CORE_LEASH_DISTANCE
                 )
@@ -3925,7 +3982,7 @@ class SmartTactic:
                         self.memory.mode == MODE_DEVELOP
                         and not owns_beacon
                         and _distance(worker.position, turn.core.position)
-                        > DEVELOP_WIDE_SEARCH_MAX_RADIUS
+                        > DEVELOP_LOCAL_RECALL_RADIUS
                     ):
                         recall_goal = self.memory.worker_goals.get(str(worker.id))
                         if not (
@@ -4067,7 +4124,7 @@ class SmartTactic:
                     continue
                 outside_local_area = (
                     _distance(worker.position, turn.core.position)
-                    > DEVELOP_WIDE_SEARCH_MAX_RADIUS
+                    > DEVELOP_LOCAL_RECALL_RADIUS
                 )
                 if not outside_local_area:
                     if existing_recall:
@@ -4433,11 +4490,14 @@ class SmartTactic:
                 self.memory.clear_worker_goal(worker)
                 continue
             if goal.kind == "resource_sweep":
-                search_leash = (
-                    BEACON_RESOURCE_SWEEP_MAX_RADIUS
-                    if self.memory.mode == MODE_BEACON
-                    else AGGRESS_RESOURCE_SWEEP_MAX_RADIUS
-                )
+                if self._catastrophic_rebuild_active(turn):
+                    search_leash = RECOVERY_RESOURCE_SWEEP_MAX_RADIUS
+                else:
+                    search_leash = (
+                        BEACON_RESOURCE_SWEEP_MAX_RADIUS
+                        if self.memory.mode == MODE_BEACON
+                        else AGGRESS_RESOURCE_SWEEP_MAX_RADIUS
+                    )
             else:
                 search_leash = DEVELOP_WIDE_SEARCH_MAX_RADIUS
             if (
@@ -4804,6 +4864,8 @@ class SmartTactic:
         owns_beacon = _owns_beacon(turn)
         strategic_beacon = None if owns_beacon else turn.beacon.position
         core_leash_distance = self._refill_probe_core_leash_distance(owns_beacon)
+        if self._catastrophic_rebuild_active(turn):
+            core_leash_distance = RECOVERY_RESOURCE_SWEEP_MAX_RADIUS
         for worker_id, worker in unassigned.items():
             goal = self.memory.worker_goals.get(str(worker_id))
             if goal is None or goal.kind != "refilled_chunk":
@@ -4879,6 +4941,8 @@ class SmartTactic:
             else None
         )
         core_leash_distance = self._refill_probe_core_leash_distance(owns_beacon)
+        if self._catastrophic_rebuild_active(turn):
+            core_leash_distance = RECOVERY_RESOURCE_SWEEP_MAX_RADIUS
         active_chunks = {
             _chunk_of(goal.position)
             for goal in self.memory.worker_goals.values()
@@ -4981,11 +5045,22 @@ class SmartTactic:
     ) -> Position | None:
         base_x = chunk[0] * CHUNK_SIZE
         base_y = chunk[1] * CHUNK_SIZE
+        # 2026-08-11: 优先用采集事件学习到的真实资源锚点（chunk_anchors）。
+        # 原固定格网偏移 (8,8)/(24,8)/(8,24)/(24,24)/(16,16) 会错过真实资源格
+        # （如 chunk(11,-17) 锚点偏移是 (8,30)，固定偏移里没有），导致工人被派到
+        # 空点后 goal_reached_rotate 无限空转。锚点不可用（障碍/占用/超 leash）时
+        # 才回退到固定格网偏移。
+        candidate_positions: list[Position] = []
+        anchor = self.memory.chunk_anchors.get(chunk)
+        if anchor is not None:
+            candidate_positions.append(anchor)
         offsets = ((8, 8), (24, 8), (8, 24), (24, 24), (16, 16))
         rotation = (tick // 4 + worker_id.int) % len(offsets)
         ordered = offsets[rotation:] + offsets[:rotation]
-        for dx, dy in ordered:
-            position = (base_x + dx, base_y + dy)
+        candidate_positions.extend(
+            (base_x + dx, base_y + dy) for dx, dy in ordered
+        )
+        for position in candidate_positions:
             if (
                 position not in planner.obstacles
                 and _refill_probe_allowed(origin, position, strategic_beacon)
@@ -5022,7 +5097,33 @@ class SmartTactic:
         preferred_vector = preferred_vectors[(worker_number - 1) % 8]
         candidates: set[Position] = set()
         if wide_search:
-            if self.memory.mode == MODE_AGGRESS:
+            if self._catastrophic_rebuild_active(turn):
+                completed_radius = min(
+                    self.memory.worker_search_radius.get(str(worker.id), 0),
+                    RECOVERY_RESOURCE_SWEEP_MAX_RADIUS,
+                )
+                current_radius = _distance(turn.core.position, worker.position)
+                next_radius = max(
+                    RECOVERY_RESOURCE_SWEEP_INITIAL_RADIUS,
+                    min(
+                        RECOVERY_RESOURCE_SWEEP_MAX_RADIUS,
+                        max(
+                            completed_radius + RECOVERY_RESOURCE_SWEEP_STEP,
+                            current_radius + RECOVERY_RESOURCE_SWEEP_STEP,
+                        ),
+                    ),
+                )
+                radii = tuple(
+                    radius
+                    for radius in (
+                        next_radius,
+                        next_radius - RECOVERY_RESOURCE_SWEEP_STEP,
+                        next_radius - RECOVERY_RESOURCE_SWEEP_STEP * 2,
+                    )
+                    if RECOVERY_RESOURCE_SWEEP_INITIAL_RADIUS <= radius
+                    <= RECOVERY_RESOURCE_SWEEP_MAX_RADIUS
+                )
+            elif self.memory.mode == MODE_AGGRESS:
                 # Resource recovery uses its own bounded local sweep state.
                 # Do not reuse the Develop-mode radius, which may have grown
                 # to 48 before the mode changed.
@@ -5116,11 +5217,36 @@ class SmartTactic:
                 return None
         else:
             radii = (5, 8, 11)
-        for radius in radii:
-            for dx in range(-radius, radius + 1):
-                dy = radius - abs(dx)
+        # 2026-08-11 螺旋外扩：wide_search 时按 worker 序号分配到 8 个不同扇形，
+        # 从 core 逐圈向外推进，确保各方向覆盖。radii 较小时角度离散会塌缩到主轴，
+        # 故每个扇形用多个角分辨率样本 + 多个半径环，保证 8 sector 都能被探到。
+        if wide_search and radii:
+            sector_count = max(4, 8)
+            sector_index = (worker_number - 1) % sector_count
+            sector_angle = 360.0 / sector_count * (math.pi / 180.0)
+            base_angle = sector_index * sector_angle
+            radial_max = max(radii)
+            for radius in radii:
+                # 扇形内沿弧采样，radius 越大采样越细（螺旋推进）
+                # 固定取 5 个采样角，覆盖扇区内不同子方向
+                for sub in (0.0, 0.25, 0.5, 0.75, 1.0):
+                    angle = base_angle + sub * sector_angle * 0.8
+                    # 半径随圈推进，每圈在扇区内弧向微移（螺旋）
+                    dx = round(math.cos(angle) * radius)
+                    dy = round(math.sin(angle) * radius)
+                    candidates.add((turn.core.position[0] + dx, turn.core.position[1] + dy))
+            # 额外加一轮更大半径的扇形边缘点，确保 8 方向都被生成
+            for sub in (0.0, 0.5, 1.0):
+                angle = base_angle + sub * sector_angle
+                dx = round(math.cos(angle) * (radial_max + 8))
+                dy = round(math.sin(angle) * (radial_max + 8))
                 candidates.add((turn.core.position[0] + dx, turn.core.position[1] + dy))
-                candidates.add((turn.core.position[0] + dx, turn.core.position[1] - dy))
+        else:
+            for radius in radii:
+                for dx in range(-radius, radius + 1):
+                    dy = radius - abs(dx)
+                    candidates.add((turn.core.position[0] + dx, turn.core.position[1] + dy))
+                    candidates.add((turn.core.position[0] + dx, turn.core.position[1] - dy))
         candidates.difference_update(planner.obstacles)
         candidates.difference_update(reserved_targets)
         candidates = {
@@ -5892,6 +6018,12 @@ class SmartTactic:
             or combat_shortfall > 0
         )
 
+    def _catastrophic_rebuild_active(self, turn: Turn) -> bool:
+        """Keep disaster recovery active until the first home screen exists."""
+        if turn.core is None or not self.memory.catastrophic_rebuild_pending:
+            return False
+        return any(self._home_guard_shortfall(turn))
+
     def _maybe_activate_beacon_expedition(self, turn: Turn) -> None:
         """Send only surplus combat units after the fixed home reserve is safe."""
         if (
@@ -6029,20 +6161,57 @@ class SmartTactic:
         self,
         turn: Turn,
     ) -> tuple[set[UUID], set[UUID]]:
-        """Keep the promised 3+3 Core reserve out of beacon actions.
-
-        Explicit beacon control remains usable during an early, incomplete
-        opening; once the complete home reserve exists it is never borrowed by
-        the expedition.
-        """
-        home_vanguards, home_rangers = self._minimum_home_reserve_ids(turn)
-        reserve_complete = (
-            len(home_vanguards) >= RAID_HOME_RESERVE_VANGUARDS
-            and len(home_rangers) >= RAID_HOME_RESERVE_RANGERS
-        )
-        if self._home_recovery_active(turn) and not reserve_complete:
+        """Keep a recovery-aware, force-scaled reserve out of Beacon actions."""
+        if turn.core is None:
             return set(), set()
-        return home_vanguards, home_rangers
+
+        # During rebuilding or a live Core emergency there is no surplus:
+        # every surviving combat Unit belongs to the home screen.  This also
+        # turns a distant Beacon expedition into a full recall after the first
+        # authoritative CORE_DAMAGED event.
+        emergency_threats = self._core_emergency_threats(turn)
+        if (
+            self._core_recently_damaged(turn)
+            or len(emergency_threats) >= AGGRESS_CORE_REINFORCEMENT_ENEMY_COUNT
+            or self._catastrophic_rebuild_active(turn)
+        ):
+            return (
+                {unit.id for unit in turn.vanguards},
+                {unit.id for unit in turn.rangers},
+            )
+
+        def reserve_count(population: int, minimum: int) -> int:
+            if len(turn.vanguards) + len(turn.rangers) < (
+                BEACON_HOME_RESERVE_SCALE_MIN_COMBAT
+            ):
+                return min(population, minimum)
+            scaled = (
+                population * BEACON_HOME_RESERVE_NUMERATOR
+                + BEACON_HOME_RESERVE_DENOMINATOR
+                - 1
+            ) // BEACON_HOME_RESERVE_DENOMINATOR
+            return min(population, max(minimum, scaled))
+
+        vanguard_count = reserve_count(
+            len(turn.vanguards),
+            RAID_HOME_RESERVE_VANGUARDS,
+        )
+        ranger_count = reserve_count(
+            len(turn.rangers),
+            RAID_HOME_RESERVE_RANGERS,
+        )
+        vanguards = sorted(
+            turn.vanguards,
+            key=lambda unit: (_distance(unit.position, turn.core.position), unit.id.bytes),
+        )
+        rangers = sorted(
+            turn.rangers,
+            key=lambda unit: (_distance(unit.position, turn.core.position), unit.id.bytes),
+        )
+        return (
+            {unit.id for unit in vanguards[:vanguard_count]},
+            {unit.id for unit in rangers[:ranger_count]},
+        )
 
     def _beacon_core_assault_target(
         self,
@@ -10211,6 +10380,7 @@ class SmartTactic:
                 return UnitType.VANGUARD
             if (
                 combat_shortfall > 0
+                and not self._catastrophic_rebuild_active(turn)
                 and workers < RECOVERY_BRIDGE_MAX_WORKERS
                 and budget >= worker_cost
                 and projected_resources - worker_cost >= 1
@@ -10219,6 +10389,7 @@ class SmartTactic:
                 return UnitType.WORKER
             if (
                 workers < 6
+                and not self._catastrophic_rebuild_active(turn)
                 and budget >= worker_cost
                 and not turn.resource_cells
                 and not self.memory.browser_resource_hints

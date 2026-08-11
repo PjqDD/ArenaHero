@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import sys
+import time
 import traceback
 from getpass import getpass
 from pathlib import Path
@@ -294,16 +295,31 @@ def main() -> int:
         parser.error("--max-turns must be positive")
 
     try:
-        play(
-            load_api_key(),
-            base_url=args.base_url,
-            websocket_url=args.websocket_url,
-            max_turns=args.max_turns,
-            memory_path=args.memory_file,
-            telemetry_path=args.telemetry_file,
-            stats_path=args.stats_file,
-            event_log_path=args.event_log_file,
-        )
+        api_key = load_api_key()
+        reconnect_delay = 0.5
+        while True:
+            try:
+                play(
+                    api_key,
+                    base_url=args.base_url,
+                    websocket_url=args.websocket_url,
+                    max_turns=args.max_turns,
+                    memory_path=args.memory_file,
+                    telemetry_path=args.telemetry_file,
+                    stats_path=args.stats_file,
+                    event_log_path=args.event_log_file,
+                )
+                break
+            except TransportError as exc:
+                print(
+                    "Arena Hero transport interruption: "
+                    f"{type(exc).__name__}; reconnecting in "
+                    f"{reconnect_delay:.1f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(reconnect_delay)
+                reconnect_delay = min(5.0, reconnect_delay * 2)
     except KeyboardInterrupt:
         print("Stopped by user.", flush=True)
         return 0
@@ -316,9 +332,6 @@ def main() -> int:
             file=sys.stderr,
         )
         return 3
-    except TransportError as exc:
-        print(f"Arena Hero transport failure: {type(exc).__name__}", file=sys.stderr)
-        return 4
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 5

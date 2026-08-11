@@ -112,6 +112,43 @@ assert.deepEqual(overlay.findResourceCells(resourceCanvas), [
   [-23, 86],
 ]);
 
+// 误报过滤：8x8 区块内资源点 >32（过半）视为误抓的成片区域，整块丢弃；
+// 正常稀疏资源点保留。
+{
+  const dense = [];
+  for (let bx = 0; bx < 8; bx += 1) {
+    for (let by = 0; by < 8; by += 1) {
+      dense.push([-128 + bx, -240 + by]); // 单 8x8 区块 64 格全满的假数据（对齐真实误报特征）
+    }
+  }
+  const fakeCanvas = { parentElement: null };
+  Object.defineProperty(fakeCanvas, "__reactFiber$denseTest", {
+    value: {
+      memoizedState: {
+        memoizedState: {
+          resources: [
+            ...dense,
+            [-62, 68],
+            { position: [-61, 76], type: "iron_ore" },
+          ],
+        },
+        baseState: null,
+        queue: null,
+        next: null,
+      },
+      memoizedProps: null,
+      pendingProps: null,
+      stateNode: null,
+      return: null,
+      alternate: null,
+    },
+  });
+  assert.deepEqual(overlay.findResourceCells(fakeCanvas), [
+    [-62, 68],
+    [-61, 76],
+  ]);
+}
+
 assert.deepEqual(
   overlay.normalizeSettings({
     lineWidth: 99,

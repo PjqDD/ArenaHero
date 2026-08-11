@@ -17,6 +17,24 @@ foreach ($process in $old) {
 }
 Start-Sleep -Milliseconds 800
 
+# Start-Process truncates redirected files. Preserve the previous session so a
+# crash or transport failure can still be diagnosed after an automatic/manual
+# restart. These archives are covered by the arena_hero_*.log ignore rule.
+$logTimestamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
+foreach ($logSpec in @(
+    @{ Current = 'agent.log'; Archive = "arena_hero_agent_$logTimestamp.log" },
+    @{ Current = 'agent_err.log'; Archive = "arena_hero_agent_err_$logTimestamp.log" }
+)) {
+    $currentLog = Join-Path $root $logSpec.Current
+    if (Test-Path -LiteralPath $currentLog) {
+        $logFile = Get-Item -LiteralPath $currentLog
+        if ($logFile.Length -gt 0) {
+            Move-Item -LiteralPath $currentLog `
+                -Destination (Join-Path $root $logSpec.Archive)
+        }
+    }
+}
+
 Start-Process -FilePath "$root\.venv\Scripts\python.exe" `
     -ArgumentList "$root\arena_hero_route_overlay_server.py", `
         "--routes-file", "$root\.arena_hero_routes.json", `

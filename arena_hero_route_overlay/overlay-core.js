@@ -534,7 +534,43 @@
       queue.push({ fiber: fiber.return, depth: depth + 1 });
       queue.push({ fiber: fiber.alternate, depth });
     }
-    return Array.from(values.values()).slice(0, 4096);
+    const collected = Array.from(values.values());
+    return pruneImplausibleResourceCells(collected);
+  }
+
+  // 合理性过滤：真实资源点在 8x8 区块内不会成片密集。
+  // 误报特征 = 区块内几乎每格都是"资源"（游戏状态里存整片区域的数组被误当资源点）。
+  // 8x8 区块 > 32 格（过半）即视为误报，整块丢弃，避免污染策略的 known_resource_cells。
+  const RESOURCE_CELL_BLOCK = 8;
+  const RESOURCE_CELL_BLOCK_QUOTA = 32;
+
+  function pruneImplausibleResourceCells(positions) {
+    if (!positions.length) {
+      return [];
+    }
+    const counts = new Map();
+    for (const position of positions) {
+      const key = `${Math.floor(position[0] / RESOURCE_CELL_BLOCK)},${Math.floor(
+        position[1] / RESOURCE_CELL_BLOCK,
+      )}`;
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    const denseBlocks = new Set();
+    for (const [key, count] of counts) {
+      if (count > RESOURCE_CELL_BLOCK_QUOTA) {
+        denseBlocks.add(key);
+      }
+    }
+    if (!denseBlocks.size) {
+      return positions;
+    }
+    const pruned = positions.filter((position) => {
+      const key = `${Math.floor(position[0] / RESOURCE_CELL_BLOCK)},${Math.floor(
+        position[1] / RESOURCE_CELL_BLOCK,
+      )}`;
+      return !denseBlocks.has(key);
+    });
+    return pruned;
   }
 
   return {

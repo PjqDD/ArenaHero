@@ -3086,10 +3086,12 @@ class BalancedTacticTests(unittest.TestCase):
         self.assertEqual(_chunk_of(memory.worker_goals[str(WORKER_LOW)].position), (0, 0))
 
     def test_develop_rejects_productive_chunk_beyond_local_leash(self) -> None:
+        # 2026-08-11: 搜索半径已从 28 扩到 160（螺旋外扩），leash 随之变大。
+        # chunk 锚点距 core 200 > 160 才应被拒。
         memory = TacticMemory(
             chunk_harvests={(1, 0): 2},
             chunk_next_refill={(1, 0): 8},
-            chunk_anchors={(1, 0): (40, 0)},
+            chunk_anchors={(1, 0): (200, 0)},
         )
         turn, _ = make_turn(
             tick=12,
@@ -3111,7 +3113,7 @@ class BalancedTacticTests(unittest.TestCase):
         memory = TacticMemory(
             mode=MODE_DEVELOP,
             worker_goals={
-                str(WORKER_LOW): WorkerGoal("refilled_chunk", (40, 0), 8),
+                str(WORKER_LOW): WorkerGoal("refilled_chunk", (200, 0), 8),
             },
         )
         turn, _ = make_turn(
@@ -3971,6 +3973,116 @@ class ModeAndRecallTests(unittest.TestCase):
 
         self.assertEqual(tactic._home_guard_shortfall(turn), (1, 2, 3))
         self.assertTrue(tactic._home_recovery_active(turn))
+
+    def test_beacon_recovery_saves_for_first_combat_unit_after_three_workers(
+        self,
+    ) -> None:
+        turn, _ = make_turn(
+            own_core=core((0, 0)),
+            units=(
+                worker(WORKER_LOW, (2, 0)),
+                worker(WORKER_HIGH, (3, 0)),
+                worker(WORKER_THIRD, (4, 0)),
+            ),
+            resources=6,
+            beacon=ChampionBeacon(position=(80, 0)),
+        )
+
+        SmartTactic(
+            TacticMemory(
+                mode=MODE_BEACON,
+                last_core_destroyed_tick=7,
+                catastrophic_rebuild_pending=True,
+            )
+        ).choose_actions(turn)
+
+        self.assertNotIsInstance(turn.plan.core_action, SpawnAction)
+
+    def test_completed_catastrophic_rebuild_does_not_reopen_after_later_loss(
+        self,
+    ) -> None:
+        vanguard_ids = [UUID(int=0xB050 + index) for index in range(3)]
+        ranger_ids = [UUID(int=0xB060 + index) for index in range(3)]
+        rebuilt_turn, _ = make_turn(
+            tick=50,
+            own_core=core((0, 0)),
+            units=tuple(
+                vanguard((index + 1, 0), unit_id)
+                for index, unit_id in enumerate(vanguard_ids)
+            ) + tuple(
+                ranger((index + 1, 2), unit_id)
+                for index, unit_id in enumerate(ranger_ids)
+            ),
+        )
+        memory = TacticMemory(
+            mode=MODE_BEACON,
+            last_core_destroyed_tick=7,
+            catastrophic_rebuild_pending=True,
+        )
+        tactic = SmartTactic(memory)
+
+        memory.observe(rebuilt_turn)
+
+        self.assertFalse(memory.catastrophic_rebuild_pending)
+        later_loss_turn, _ = make_turn(
+            tick=51,
+            own_core=core((0, 0)),
+            units=tuple(
+                vanguard((index + 1, 0), unit_id)
+                for index, unit_id in enumerate(vanguard_ids)
+            ) + tuple(
+                ranger((index + 1, 2), unit_id)
+                for index, unit_id in enumerate(ranger_ids[:-1])
+            ),
+        )
+        memory.observe(later_loss_turn)
+        self.assertFalse(tactic._catastrophic_rebuild_active(later_loss_turn))
+
+    def test_beacon_home_reserve_scales_with_large_army(self) -> None:
+        vanguard_ids = [UUID(int=0xB100 + index) for index in range(8)]
+        ranger_ids = [UUID(int=0xB200 + index) for index in range(12)]
+        turn, _ = make_turn(
+            own_core=core((0, 0)),
+            units=tuple(
+                vanguard((index + 1, 0), unit_id)
+                for index, unit_id in enumerate(vanguard_ids)
+            ) + tuple(
+                ranger((index + 1, 2), unit_id)
+                for index, unit_id in enumerate(ranger_ids)
+            ),
+        )
+        tactic = SmartTactic(TacticMemory(mode=MODE_BEACON))
+
+        home_vanguards, home_rangers = tactic._beacon_home_reserve_ids(turn)
+
+        self.assertEqual(len(home_vanguards), 4)
+        self.assertEqual(len(home_rangers), 6)
+
+    def test_beacon_core_damage_recalls_every_surviving_combat_unit(self) -> None:
+        vanguard_ids = [UUID(int=0xB300 + index) for index in range(8)]
+        ranger_ids = [UUID(int=0xB400 + index) for index in range(12)]
+        memory = TacticMemory(
+            mode=MODE_BEACON,
+            last_core_damaged_tick=100,
+        )
+        turn, _ = make_turn(
+            tick=101,
+            own_core=core((0, 0), shield=4),
+            units=tuple(
+                vanguard((40 + index, 0), unit_id)
+                for index, unit_id in enumerate(vanguard_ids)
+            ) + tuple(
+                ranger((40 + index, 2), unit_id)
+                for index, unit_id in enumerate(ranger_ids)
+            ),
+            resources=0,
+        )
+        tactic = SmartTactic(memory)
+
+        home_vanguards, home_rangers = tactic._beacon_home_reserve_ids(turn)
+
+        self.assertEqual(home_vanguards, set(vanguard_ids))
+        self.assertEqual(home_rangers, set(ranger_ids))
 
     def test_beacon_escort_never_steals_the_six_home_defenders(self) -> None:
         vanguard_ids = [UUID(int=0x9100 + index) for index in range(6)]
@@ -5961,9 +6073,9 @@ class ModeAndRecallTests(unittest.TestCase):
         memory = TacticMemory(
             mode=MODE_DEVELOP,
             worker_goals={
-                str(WORKER_LOW): WorkerGoal("develop_frontier", (48, 0), 10),
+                str(WORKER_LOW): WorkerGoal("develop_frontier", (200, 0), 10),
             },
-            worker_search_radius={str(WORKER_LOW): 48},
+            worker_search_radius={str(WORKER_LOW): 200},
         )
         turn, _ = make_turn(
             tick=20,

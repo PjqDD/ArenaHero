@@ -9,7 +9,7 @@
 - 需要叠加层时使用 Chrome 或 Edge 111+。
 - Windows 一键脚本需要 PowerShell 7 或 Windows PowerShell 5.1。
 
-项目只依赖官方 `arena-hero>=0.2.9,<0.3` SDK。SDK 负责 WebSocket、HTTP、模型验证、重连和幂等重试，项目只负责战术决策。
+项目只依赖官方 `arena-hero>=0.2.9,<0.3` SDK。SDK 负责 WebSocket、HTTP、模型验证和幂等重试，启动器在一次传输会话彻底中断后以 0.5 秒起、最多 5 秒的退避间隔持续重连；战术记忆保存在本地文件中，不会因新会话丢失。
 
 ## 2. Windows 安装
 
@@ -89,6 +89,8 @@ Windows：
 
 - `agent.log`
 - `agent_err.log`
+
+`start_all.ps1` 重启前会把非空输出日志滚存为带毫秒时间戳的 `arena_hero_agent_*.log`，避免上一会话的异常现场被输出重定向覆盖。
 
 叠加层服务地址为 `http://127.0.0.1:8765`。健康检查：
 
