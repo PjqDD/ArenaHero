@@ -65,6 +65,7 @@ from arena_hero_strategy import (
     ASSAULT_SWEEP_MIN_RADIUS,
     ASSAULT_SWEEP_PROFILE_VERSION,
     ASSAULT_SWEEP_SECTOR_OFFSETS,
+    DEVELOP_LOCAL_RECALL_RADIUS,
     DEVELOP_RESOURCE_TARGET_CORE_LEASH_DISTANCE,
     DEVELOP_WIDE_SEARCH_MAX_RADIUS,
     EnemySighting,
@@ -5970,7 +5971,8 @@ class ModeAndRecallTests(unittest.TestCase):
         )
 
     def test_develop_keeps_existing_recall_when_resource_is_visible(self) -> None:
-        far_position = (-DEVELOP_RESOURCE_TARGET_CORE_LEASH_DISTANCE - 2, 0)
+        # far 超过 develop_local_recall 半径，触发召回保护
+        far_position = (-DEVELOP_LOCAL_RECALL_RADIUS - 2, 0)
         memory = TacticMemory(
             mode=MODE_DEVELOP,
             worker_goals={

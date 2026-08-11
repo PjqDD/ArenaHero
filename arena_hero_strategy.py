@@ -130,10 +130,11 @@ POST_RECALL_SWEEP_READY_DENOMINATOR = 5
 # 2026-08-11: 视野内无资源时持续螺旋外扩。原 28 导致 core 周围荒漠时工人空转；
 # 160 让工人能逐圈推进到 160 格，触达最近真实富矿区。
 DEVELOP_WIDE_SEARCH_MAX_RADIUS = 160
-# 2026-08-11: develop_local_recall 的"当地范围"判定保持原 28（与探索半径解耦）。
-# 探索半径扩到 160 只用于工人找资源；超过 28 格的远处工人仍需召回 core，
-# 否则远处 worker 不会被拉回防守/卸货，破坏召回保护。
-DEVELOP_LOCAL_RECALL_RADIUS = 28
+# 2026-08-11: develop_local_recall 的"当地范围"判定与探索半径解耦。
+# 初设 28，但 core 附近真实资源锚点可达 31-38 格，28 会把手持/临近采集目标的
+# worker 拉回 core，导致到不了采集点空转。放宽到 48：覆盖近端锚点（31-38）有余量，
+# 同时仍把 >48 格的失控远端 worker 召回 core，保留召回保护。
+DEVELOP_LOCAL_RECALL_RADIUS = 48
 # A visible resource can still be a poor economic target when it was revealed
 # by a distant scout.  Keep new Develop-mode assignments inside the same local
 # production radius unless a Worker is already close enough to finish it.
@@ -4832,9 +4833,10 @@ class SmartTactic:
 
     def _refill_probe_limit(self, turn: Turn) -> int:
         if self.memory.mode == MODE_DEVELOP:
-            # A seven-Worker economy can afford three concurrent probes of
-            # known productive chunks while four Workers retain local coverage.
-            return min(3, max(1, (len(turn.workers) + 1) // 2))
+            # 2026-08-11: core 附近已知资源锚点稀少（本次 3 个），此前 (n+1)//2
+            # 只允许 2/3 工人采已知 chunk，第 3 个被迫去 develop_frontier 空转。
+            # 放宽到 min(3, n)：所有工人优先采已知刷新锚点，减少无效探索。
+            return min(3, max(1, len(turn.workers)))
         if self.memory.mode == MODE_AGGRESS:
             # Keep at least half the Workers on local sweep/deposit duty while
             # up to three revisit productive chunks after their refill Tick.
