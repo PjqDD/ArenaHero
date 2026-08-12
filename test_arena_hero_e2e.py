@@ -155,6 +155,7 @@ class EndToEndTests(unittest.TestCase):
                     "rally_point": None,
                     "aggress_vanguards": 0,
                     "aggress_rangers": 0,
+            "ally_support_enabled": False,
                 },
             )
 

@@ -1381,6 +1381,11 @@ class BalancedTacticTests(unittest.TestCase):
                 json.dumps({"version": 1, "accounts": ["buddy_hero"]}),
                 encoding="utf-8",
             )
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps({"mode": "develop", "ally_support_enabled": True}),
+                encoding="utf-8",
+            )
             # 受伤的盟友 Core (hp=2 < 5)
             hurt_ally = CoreView(
                 kind="CORE",
@@ -1402,18 +1407,11 @@ class BalancedTacticTests(unittest.TestCase):
                 beacon=ChampionBeacon(position=(0, 0)),
             )
             memory = TacticMemory(mode=MODE_DEVELOP)
-            # 启用共同抗敌
-            import arena_hero_strategy as _s
-
-            original = _s.DEVELOP_ALLY_SUPPORT_ENABLED
-            _s.DEVELOP_ALLY_SUPPORT_ENABLED = True
-            try:
-                summary = SmartTactic(
-                    memory,
-                    allies_path=allies_path,
-                ).choose_actions(turn)
-            finally:
-                _s.DEVELOP_ALLY_SUPPORT_ENABLED = original
+            summary = SmartTactic(
+                memory,
+                control_path=control_path,
+                allies_path=allies_path,
+            ).choose_actions(turn)
             self.assertTrue(
                 any("ally_support" in item for item in summary.decisions),
                 f"受攻击盟友 Core 应触发支援, 实际: {summary.decisions}",
@@ -1427,6 +1425,11 @@ class BalancedTacticTests(unittest.TestCase):
                 json.dumps({"version": 1, "accounts": ["buddy_hero"]}),
                 encoding="utf-8",
             )
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps({"mode": "develop", "ally_support_enabled": True}),
+                encoding="utf-8",
+            )
             turn, _ = make_turn(
                 own_core=core((0, 0)),
                 units=(
@@ -1437,17 +1440,11 @@ class BalancedTacticTests(unittest.TestCase):
                 beacon=ChampionBeacon(position=(0, 0)),
             )
             memory = TacticMemory(mode=MODE_DEVELOP)
-            import arena_hero_strategy as _s
-
-            original = _s.DEVELOP_ALLY_SUPPORT_ENABLED
-            _s.DEVELOP_ALLY_SUPPORT_ENABLED = True
-            try:
-                summary = SmartTactic(
-                    memory,
-                    allies_path=allies_path,
-                ).choose_actions(turn)
-            finally:
-                _s.DEVELOP_ALLY_SUPPORT_ENABLED = original
+            summary = SmartTactic(
+                memory,
+                control_path=control_path,
+                allies_path=allies_path,
+            ).choose_actions(turn)
             self.assertFalse(
                 any("ally_support" in item for item in summary.decisions),
                 f"满血盟友 Core 不应触发支援, 实际: {summary.decisions}",

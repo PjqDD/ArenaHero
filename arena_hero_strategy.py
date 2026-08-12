@@ -632,6 +632,8 @@ class TacticMemory:
     migration_site_checked: bool = False
     migration_site_score: int = 0
     auto_migrate: bool = False
+    # 2026-08-12 共同抗敌开关（control 配置）：盟友 Core 被攻击时派兵支援。
+    ally_support_enabled: bool = False
     unit_label_mapping: dict[str, str] = field(default_factory=dict)
     last_events: list[dict] = field(default_factory=list)
     unit_positions_for_overlay: dict[str, Position] = field(default_factory=dict)
@@ -1881,6 +1883,9 @@ class TacticMemory:
             else:
                 self.migration_candidate = None
             self.auto_migrate = bool(data.get("auto_migrate", self.auto_migrate))
+            self.ally_support_enabled = bool(
+                data.get("ally_support_enabled", self.ally_support_enabled)
+            )
             # 2026-08-12 坐标迁移：手动指定迁移目标（mode 同时设为 migrate）。
             raw_manual_target = data.get("migration_target")
             if (
@@ -8261,9 +8266,9 @@ class SmartTactic:
         """
         core_target = self._pick_enemy_core_target(turn)
         # 2026-08-12 共同抗敌（方案A）：可见盟友 Core 血量低于满血 = 正被攻击，
-        # 优先派兵支援盟友（血量信号，避免误判盟友守军）。
+        # 优先派兵支援盟友（血量信号，避免误判盟友守军）。开关走 control 配置。
         ally_support_target = None
-        if DEVELOP_ALLY_SUPPORT_ENABLED:
+        if self.memory.ally_support_enabled:
             hurt_allies = [
                 enemy
                 for enemy in turn.visible_enemies

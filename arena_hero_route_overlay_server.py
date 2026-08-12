@@ -417,6 +417,9 @@ def load_control(path: Path) -> dict[str, Any]:
                 data.get("migration_candidate")
             )
             result["auto_migrate"] = bool(data.get("auto_migrate", False))
+        result["ally_support_enabled"] = bool(
+            data.get("ally_support_enabled", False)
+        )
         for key in ("aggress_vanguards", "aggress_rangers"):
             raw_value = data.get(key, 0)
             result[key] = (
@@ -446,6 +449,7 @@ def load_control(path: Path) -> dict[str, Any]:
             "rally_point": None,
             "aggress_vanguards": 0,
             "aggress_rangers": 0,
+            "ally_support_enabled": False,
         }
 
 

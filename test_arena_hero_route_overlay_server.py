@@ -207,6 +207,7 @@ class RouteOverlayServerTests(unittest.TestCase):
                         "rally_point": None,
                         "aggress_vanguards": 0,
                         "aggress_rangers": 0,
+            "ally_support_enabled": False,
                     },
                 )
 
@@ -231,6 +232,7 @@ class RouteOverlayServerTests(unittest.TestCase):
                         "rally_point": None,
                         "aggress_vanguards": 0,
                         "aggress_rangers": 0,
+            "ally_support_enabled": False,
                     },
                 )
 
@@ -249,6 +251,7 @@ class RouteOverlayServerTests(unittest.TestCase):
                         "rally_point": None,
                         "aggress_vanguards": 0,
                         "aggress_rangers": 0,
+            "ally_support_enabled": False,
                     },
                 )
                 self.assertEqual(
@@ -264,6 +267,7 @@ class RouteOverlayServerTests(unittest.TestCase):
                         "rally_point": None,
                         "aggress_vanguards": 0,
                         "aggress_rangers": 0,
+            "ally_support_enabled": False,
                     },
                 )
             finally:
@@ -345,6 +349,7 @@ class RouteOverlayServerTests(unittest.TestCase):
                 "rally_point": None,
                 "aggress_vanguards": 0,
                 "aggress_rangers": 0,
+            "ally_support_enabled": False,
             },
         )
 
@@ -363,6 +368,7 @@ class RouteOverlayServerTests(unittest.TestCase):
                         "rally_point": [-20, 80],
                         "aggress_vanguards": 6,
                         "aggress_rangers": 7,
+            "ally_support_enabled": False,
                     }
                 ),
                 encoding="utf-8",
@@ -402,6 +408,7 @@ class RouteOverlayServerTests(unittest.TestCase):
                 "rally_point": [-20, 80],
                 "aggress_vanguards": 6,
                 "aggress_rangers": 7,
+            "ally_support_enabled": False,
             },
         )
 
@@ -516,6 +523,7 @@ class RouteOverlayServerTests(unittest.TestCase):
                         "rally_point": None,
                         "aggress_vanguards": 0,
                         "aggress_rangers": 0,
+            "ally_support_enabled": False,
                     },
                 )
             finally:
