@@ -34,6 +34,7 @@ Chunk = tuple[int, int]
 CHUNK_SIZE = 32
 ROUTES_FILENAME = ".arena_hero_routes.json"
 RECOVERY_TARGETS_FILENAME = ".arena_hero_recovery_targets.json"
+ALLIES_FILENAME = ".arena_hero_allies.json"
 CONTROL_FILENAME = ".arena_hero_control.json"
 STATS_FILENAME = ".arena_hero_stats.json"
 BROWSER_INTEL_FILENAME = ".arena_hero_browser_intel.json"
@@ -458,6 +459,64 @@ class EnemySighting:
 
 
 @dataclass(frozen=True)
+class AlliesConfig:
+    """盟友白名单配置。
+
+    accounts:        盟友账号名（owner_username）→ 保护其 Core
+    core_ids:        盟友 Core 的 id → 保护其 Core
+    unit_ids:        盟友单位的 id → 我方绝不攻击/误伤
+    绝不根据"靠近某个 Core"猜归属 —— 只认白名单，防敌人贴近盟友后被误放行。
+    """
+
+    version: int = 1
+    accounts: frozenset[str] = frozenset()
+    core_ids: frozenset[str] = frozenset()
+    unit_ids: frozenset[str] = frozenset()
+
+    def is_ally_core(self, enemy: CoreView) -> bool:
+        owner = (enemy.owner_username or "").lower()
+        return (
+            str(enemy.id) in self.core_ids
+            or (bool(owner) and owner in self.accounts)
+        )
+
+    def is_ally_unit_id(self, unit_id: UUID) -> bool:
+        return str(unit_id) in self.unit_ids
+
+
+def _load_allies_config(path: Path) -> AlliesConfig:
+    if not path.is_file():
+        return AlliesConfig()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("version") != 1:
+            return AlliesConfig()
+        accounts = {
+            str(account).strip().lower()
+            for account in data.get("accounts", ())
+            if isinstance(account, str) and account.strip()
+        }
+        core_ids = {
+            str(cid).strip()
+            for cid in data.get("core_ids", ())
+            if isinstance(cid, str) and cid.strip()
+        }
+        unit_ids = {
+            str(uid).strip()
+            for uid in data.get("unit_ids", ())
+            if isinstance(uid, str) and uid.strip()
+        }
+        return AlliesConfig(
+            version=1,
+            accounts=frozenset(accounts),
+            core_ids=frozenset(core_ids),
+            unit_ids=frozenset(unit_ids),
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return AlliesConfig()
+
+
+@dataclass(frozen=True)
 class RaidEnemyMotion:
     position: Position
     stationary_observations: int
@@ -544,6 +603,9 @@ class TacticMemory:
     worker_search_radius: dict[str, int] = field(default_factory=dict)
     worker_threat_recall_until: dict[str, int] = field(default_factory=dict)
     enemy_sightings: dict[str, EnemySighting] = field(default_factory=dict)
+    # 2026-08-12 盟友功能：observe 时不把盟友 Core 记入 enemy_sightings（源头过滤，
+    # 不靠位置猜归属）。由 SmartTactic 在 observe 前按 allies 配置设置。
+    ally_core_ids: set[str] = field(default_factory=set)
     planned_moves: dict[str, PlannedMove] = field(default_factory=dict)
     event_totals: Counter[str] = field(default_factory=Counter)
     decision_totals: Counter[str] = field(default_factory=Counter)
@@ -1516,6 +1578,12 @@ class TacticMemory:
         if visible_enemy_ids:
             self.last_enemy_visible_tick = turn.tick
         for enemy in turn.visible_enemies:
+            if (
+                isinstance(enemy, CoreView)
+                and str(enemy.id) in self.ally_core_ids
+            ):
+                # 盟友 Core 不记入 enemy_sightings（源头过滤，绝不靠位置猜归属）
+                continue
             self.enemy_sightings[str(enemy.id)] = EnemySighting(
                 position=enemy.position,
                 seen_tick=turn.tick,
@@ -1809,6 +1877,23 @@ class TacticMemory:
             else:
                 self.migration_candidate = None
             self.auto_migrate = bool(data.get("auto_migrate", self.auto_migrate))
+            # 2026-08-12 坐标迁移：手动指定迁移目标（mode 同时设为 migrate）。
+            raw_manual_target = data.get("migration_target")
+            if (
+                isinstance(raw_manual_target, list)
+                and len(raw_manual_target) == 2
+                and all(
+                    isinstance(value, (int, float)) and not isinstance(value, bool)
+                    for value in raw_manual_target
+                )
+            ):
+                self.migration_target = (
+                    int(raw_manual_target[0]),
+                    int(raw_manual_target[1]),
+                )
+            elif raw_manual_target is None and self.mode != MODE_MIGRATE:
+                # 手动目标显式清除（或从未设置）时，非迁移模式不保留旧目标
+                self.migration_target = None
             if self.migration_candidate != previous_candidate:
                 if previous_candidate is not None:
                     self.recovery_targets = [
@@ -2829,15 +2914,38 @@ class SmartTactic:
         memory: TacticMemory | None = None,
         *,
         control_path: Path | None = None,
+        allies_path: Path | None = None,
     ) -> None:
         self.memory = memory or TacticMemory()
         self.control_path = control_path or Path(
             os.environ.get("ARENA_HERO_CONTROL_FILE", CONTROL_FILENAME)
         )
+        self.allies_path = allies_path or Path(
+            os.environ.get("ARENA_HERO_ALLIES_FILE", ALLIES_FILENAME)
+        )
         self._blocking_enemy_worker_ids: set[UUID] = set()
+        self.allies = _load_allies_config(self.allies_path)
+
+    def _reload_allies(self) -> None:
+        """热读 allies 配置（mtime 变化才重读，避免每 tick 读盘）。"""
+        try:
+            mtime = self.allies_path.stat().st_mtime_ns
+        except OSError:
+            return
+        if mtime != getattr(self, "_allies_mtime", None):
+            self._allies_mtime = mtime
+            self.allies = _load_allies_config(self.allies_path)
 
     def choose_actions(self, turn: Turn) -> DecisionSummary:
         self.memory.load_control(self.control_path)
+        self._reload_allies()
+        # 盟友 Core（账号/CoreID 白名单）从 enemy_sightings 源头过滤，
+        # 绝不靠位置猜归属，防敌人贴近盟友后被误放行。
+        self.memory.ally_core_ids = {
+            str(enemy.id)
+            for enemy in turn.visible_enemies
+            if isinstance(enemy, CoreView) and self.allies.is_ally_core(enemy)
+        }
         self.memory.refresh_recovery_target_hints()
         self.memory.refresh_browser_intel()
         self.memory.observe(turn)
@@ -7048,7 +7156,9 @@ class SmartTactic:
         visible_cores = [
             enemy
             for enemy in turn.visible_enemies
-            if isinstance(enemy, CoreView) and str(enemy.id) != raid_core_id
+            if isinstance(enemy, CoreView)
+            and str(enemy.id) != raid_core_id
+            and not self.allies.is_ally_core(enemy)
         ]
         if visible_cores:
             nearest = min(
@@ -7060,7 +7170,10 @@ class SmartTactic:
         remembered_cores = [
             sighting
             for object_id, sighting in self.memory.enemy_sightings.items()
-            if sighting.is_core and object_id != raid_core_id
+            if sighting.is_core
+            and object_id != raid_core_id
+            and object_id not in self.memory.ally_core_ids
+            and object_id not in self.allies.core_ids
         ]
         if remembered_cores:
             sighting = min(
@@ -7118,10 +7231,16 @@ class SmartTactic:
         return sighting.position
 
     def _enemy_is_attackable(self, enemy: UnitView | CoreView) -> bool:
+        if isinstance(enemy, CoreView):
+            # 盟友 Core 绝不攻击
+            return not self.allies.is_ally_core(enemy)
+        # 盟友单位不攻击；默认工人不做常规攻击目标（除非挡路）
         return not (
-            isinstance(enemy, UnitView)
-            and enemy.unit_type is UnitType.WORKER
-            and enemy.id not in self._blocking_enemy_worker_ids
+            self.allies.is_ally_unit_id(enemy.id)
+            or (
+                enemy.unit_type is UnitType.WORKER
+                and enemy.id not in self._blocking_enemy_worker_ids
+            )
         )
 
     def _enemy_is_stationary(

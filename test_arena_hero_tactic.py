@@ -1279,6 +1279,100 @@ class BalancedTacticTests(unittest.TestCase):
             f"不应有 enemy_core_assault 决策, 实际: {summary.decisions}",
         )
 
+    def _ally_core(self, position: tuple[int, int], owner: str) -> CoreView:
+        return CoreView(
+            kind="CORE",
+            id=UUID("00000000-0000-4000-8000-000000000300"),
+            controlled=False,
+            owner_username=owner,
+            position=position,
+            hp=5,
+            shield=0,
+            state=CoreState.NORMAL,
+        )
+
+    def test_ally_core_by_account_is_not_raided(self) -> None:
+        """2026-08-12 盟友功能：账号名白名单内的 Core 不被攻击。"""
+        with TemporaryDirectory() as directory:
+            allies_path = Path(directory) / ".arena_hero_allies.json"
+            allies_path.write_text(
+                json.dumps({"version": 1, "accounts": ["buddy_hero"]}),
+                encoding="utf-8",
+            )
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=(
+                    vanguard((1, 0), VANGUARD_ID),
+                    vanguard((2, 0), VANGUARD_TWO_ID),
+                ),
+                enemies=(self._ally_core((30, 10), "buddy_hero"),),
+                beacon=ChampionBeacon(position=(0, 0)),
+            )
+            memory = TacticMemory(mode=MODE_DEVELOP)
+            summary = SmartTactic(
+                memory,
+                allies_path=allies_path,
+            ).choose_actions(turn)
+            self.assertFalse(
+                any("enemy_core_assault" in item for item in summary.decisions),
+                f"盟友 Core 不应被攻击, 实际: {summary.decisions}",
+            )
+
+    def test_ally_core_by_id_is_not_raided(self) -> None:
+        """2026-08-12 盟友功能：Core ID 白名单内的 Core 不被攻击。"""
+        ally_id = "00000000-0000-4000-8000-000000000300"
+        with TemporaryDirectory() as directory:
+            allies_path = Path(directory) / ".arena_hero_allies.json"
+            allies_path.write_text(
+                json.dumps({"version": 1, "core_ids": [ally_id]}),
+                encoding="utf-8",
+            )
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=(
+                    vanguard((1, 0), VANGUARD_ID),
+                    vanguard((2, 0), VANGUARD_TWO_ID),
+                ),
+                enemies=(self._ally_core((30, 10), "buddy_hero"),),
+                beacon=ChampionBeacon(position=(0, 0)),
+            )
+            memory = TacticMemory(mode=MODE_DEVELOP)
+            summary = SmartTactic(
+                memory,
+                allies_path=allies_path,
+            ).choose_actions(turn)
+            self.assertFalse(
+                any("enemy_core_assault" in item for item in summary.decisions),
+                f"盟友 Core(ID) 不应被攻击, 实际: {summary.decisions}",
+            )
+
+    def test_enemy_core_still_raided_with_allies_configured(self) -> None:
+        """配置盟友后，非盟友 Core 仍正常攻击。"""
+        with TemporaryDirectory() as directory:
+            allies_path = Path(directory) / ".arena_hero_allies.json"
+            allies_path.write_text(
+                json.dumps({"version": 1, "accounts": ["buddy_hero"]}),
+                encoding="utf-8",
+            )
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=(
+                    vanguard((1, 0), VANGUARD_ID),
+                    vanguard((2, 0), VANGUARD_TWO_ID),
+                ),
+                enemies=(enemy_core((30, 10)),),  # owner=enemy_hero, 非盟友
+                beacon=ChampionBeacon(position=(0, 0)),
+            )
+            memory = TacticMemory(mode=MODE_DEVELOP)
+            summary = SmartTactic(
+                memory,
+                allies_path=allies_path,
+            ).choose_actions(turn)
+            self.assertTrue(
+                any("enemy_core_assault" in item for item in summary.decisions),
+                f"非盟友 Core 应被攻击, 实际: {summary.decisions}",
+            )
+
     def test_develop_mode_switches_to_beacon_after_expedition_is_complete(self) -> None:
         turn, _ = make_turn(
             own_core=core((0, 0)),
@@ -1902,6 +1996,43 @@ class BalancedTacticTests(unittest.TestCase):
         self.assertIsInstance(turn.plan.core_action, StartMoveAction)
         self.assertEqual(turn.plan.core_action.direction, Direction.RIGHT)
         self.assertTrue(any("reason=migration_target" in item for item in summary.decisions))
+
+    def test_manual_migration_target_via_control_file(self) -> None:
+        """2026-08-12 坐标迁移：control 手动指定 migration_target + mode=migrate。"""
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps(
+                    {
+                        "mode": "migrate",
+                        "migration_target": [3, 0],
+                        "recall": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=(
+                    vanguard((0, 1), VANGUARD_ID),
+                    vanguard((-1, 0), VANGUARD_TWO_ID),
+                    ranger((0, -1), RANGER_ID),
+                ),
+            )
+            memory = TacticMemory()
+            summary = SmartTactic(
+                memory,
+                control_path=control_path,
+            ).choose_actions(turn)
+
+            # 核心朝手动目标 (3,0) 移动（右方向）
+            self.assertIsInstance(turn.plan.core_action, StartMoveAction)
+            self.assertEqual(turn.plan.core_action.direction, Direction.RIGHT)
+            self.assertEqual(memory.migration_target, (3, 0))
+            self.assertEqual(memory.mode, MODE_MIGRATE)
+            self.assertTrue(
+                any("reason=migration_target" in item for item in summary.decisions)
+            )
 
     def test_rejected_migration_candidate_is_not_reassigned(self) -> None:
         candidate = (0, 0)
