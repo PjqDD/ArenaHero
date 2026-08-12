@@ -64,6 +64,10 @@ DEVELOP_BEACON_EXPEDITION_RANGERS = 2
 # 战斗兵去摧毁（掠夺资源 + 拿信标），后期兵力壮大后才保留足够兵力守家。
 DEVELOP_CORE_RAID_MAX_BEACON_DISTANCE = 150  # 目标 core 距信标的搜索半径
 DEVELOP_CORE_RAID_HOME_RESERVE = 3  # 战斗兵总数超过该值时保留的守家数量
+# 2026-08-12 共同抗敌（方案A，默认关）：我方视野内看到盟友 Core 且血量低于满血时
+# 派战斗兵去支援。用血量降低当"受攻击"信号，避免把盟友守军误判为敌人。
+DEVELOP_ALLY_SUPPORT_ENABLED = False
+DEVELOP_ALLY_CORE_MAX_HP = 5
 DEVELOP_SEARCH_INITIAL_RADIUS = 10
 DEVELOP_SEARCH_STEP = 8
 # 侵略模式：4 工人维持经济，游侠占战斗编制多数。
@@ -8256,11 +8260,46 @@ class SmartTactic:
         后期战斗兵超过 DEVELOP_CORE_RAID_HOME_RESERVE 后保留守家数量。
         """
         core_target = self._pick_enemy_core_target(turn)
+        # 2026-08-12 共同抗敌（方案A）：可见盟友 Core 血量低于满血 = 正被攻击，
+        # 优先派兵支援盟友（血量信号，避免误判盟友守军）。
+        ally_support_target = None
+        if DEVELOP_ALLY_SUPPORT_ENABLED:
+            hurt_allies = [
+                enemy
+                for enemy in turn.visible_enemies
+                if isinstance(enemy, CoreView)
+                and self.allies.is_ally_core(enemy)
+                and enemy.hp < DEVELOP_ALLY_CORE_MAX_HP
+            ]
+            if hurt_allies:
+                ally_support_target = min(
+                    hurt_allies,
+                    key=lambda enemy: (
+                        _distance(
+                            turn.core.position if turn.core is not None else (0, 0),
+                            enemy.position,
+                        ),
+                        enemy.id.bytes,
+                    ),
+                ).position
         if (
-            core_target is None
-            or turn.core is None
+            turn.core is None
             or self._core_emergency_threats(turn)
             or self._core_recently_damaged(turn)
+        ):
+            return
+        if ally_support_target is not None:
+            self._dispatch_develop_combat_support(
+                turn,
+                planner,
+                acted_units,
+                decisions,
+                ally_support_target,
+                reason="ally_support",
+            )
+            return
+        if (
+            core_target is None
             or _distance(turn.beacon.position, core_target)
             > DEVELOP_CORE_RAID_MAX_BEACON_DISTANCE
         ):
@@ -8310,6 +8349,55 @@ class SmartTactic:
                         f"target={core_target}"
                     )
                     self.memory.decision_totals["ranger:enemy_core_assault"] += 1
+                    acted_units.add(unit.id)
+
+    def _dispatch_develop_combat_support(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        acted_units: set[UUID],
+        decisions: list[str],
+        target: Position,
+        *,
+        reason: str,
+    ) -> None:
+        """派战斗兵前往指定目标（盟友支援/共同抗敌）。
+
+        target 是目标位置（盟友 Core 或受袭核心），派 vanguard/ranger 前往拦截。
+        """
+        combat = [unit for unit in turn.vanguards if unit.id not in acted_units]
+        combat += [unit for unit in turn.rangers if unit.id not in acted_units]
+        raid_units = sorted(
+            combat,
+            key=lambda unit: (_distance(unit.position, target), unit.id.bytes),
+        )
+        if len(combat) > DEVELOP_CORE_RAID_HOME_RESERVE:
+            raid_units = raid_units[: len(raid_units) - DEVELOP_CORE_RAID_HOME_RESERVE]
+        for unit in raid_units:
+            if unit.id in acted_units:
+                continue
+            if isinstance(unit, Vanguard):
+                direction = self._sweep_targets(unit, turn, include_core=True)
+                if direction is not None:
+                    unit.sweep(direction)
+                    decisions.append(
+                        f"vanguard:{_short_id(unit.id)} sweep "
+                        f"{direction.value} reason={reason}"
+                    )
+                    acted_units.add(unit.id)
+                    continue
+                if planner.toward(unit, target, reason):
+                    decisions.append(
+                        f"vanguard:{_short_id(unit.id)} {reason} target={target}"
+                    )
+                    acted_units.add(unit.id)
+            elif isinstance(unit, Ranger):
+                if self._ranger_shot_candidates(turn, unit, planner):
+                    continue
+                if planner.toward(unit, target, reason):
+                    decisions.append(
+                        f"ranger:{_short_id(unit.id)} {reason} target={target}"
+                    )
                     acted_units.add(unit.id)
 
     def _choose_vanguards_develop(

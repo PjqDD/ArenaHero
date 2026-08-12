@@ -1373,6 +1373,86 @@ class BalancedTacticTests(unittest.TestCase):
                 f"非盟友 Core 应被攻击, 实际: {summary.decisions}",
             )
 
+    def test_develop_mode_supports_attacked_ally_core(self) -> None:
+        """2026-08-12 共同抗敌（方案A）：受攻击盟友 Core（hp<满血）触发支援。"""
+        with TemporaryDirectory() as directory:
+            allies_path = Path(directory) / ".arena_hero_allies.json"
+            allies_path.write_text(
+                json.dumps({"version": 1, "accounts": ["buddy_hero"]}),
+                encoding="utf-8",
+            )
+            # 受伤的盟友 Core (hp=2 < 5)
+            hurt_ally = CoreView(
+                kind="CORE",
+                id=UUID("00000000-0000-4000-8000-000000000300"),
+                controlled=False,
+                owner_username="buddy_hero",
+                position=(20, 0),
+                hp=2,
+                shield=0,
+                state=CoreState.NORMAL,
+            )
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=(
+                    vanguard((1, 0), VANGUARD_ID),
+                    vanguard((2, 0), VANGUARD_TWO_ID),
+                ),
+                enemies=(hurt_ally,),
+                beacon=ChampionBeacon(position=(0, 0)),
+            )
+            memory = TacticMemory(mode=MODE_DEVELOP)
+            # 启用共同抗敌
+            import arena_hero_strategy as _s
+
+            original = _s.DEVELOP_ALLY_SUPPORT_ENABLED
+            _s.DEVELOP_ALLY_SUPPORT_ENABLED = True
+            try:
+                summary = SmartTactic(
+                    memory,
+                    allies_path=allies_path,
+                ).choose_actions(turn)
+            finally:
+                _s.DEVELOP_ALLY_SUPPORT_ENABLED = original
+            self.assertTrue(
+                any("ally_support" in item for item in summary.decisions),
+                f"受攻击盟友 Core 应触发支援, 实际: {summary.decisions}",
+            )
+
+    def test_develop_mode_does_not_support_healthy_ally_core(self) -> None:
+        """共同抗敌：满血盟友 Core 不触发支援（血量信号防误判）。"""
+        with TemporaryDirectory() as directory:
+            allies_path = Path(directory) / ".arena_hero_allies.json"
+            allies_path.write_text(
+                json.dumps({"version": 1, "accounts": ["buddy_hero"]}),
+                encoding="utf-8",
+            )
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=(
+                    vanguard((1, 0), VANGUARD_ID),
+                    vanguard((2, 0), VANGUARD_TWO_ID),
+                ),
+                enemies=(self._ally_core((20, 0), "buddy_hero"),),  # hp=5 满血
+                beacon=ChampionBeacon(position=(0, 0)),
+            )
+            memory = TacticMemory(mode=MODE_DEVELOP)
+            import arena_hero_strategy as _s
+
+            original = _s.DEVELOP_ALLY_SUPPORT_ENABLED
+            _s.DEVELOP_ALLY_SUPPORT_ENABLED = True
+            try:
+                summary = SmartTactic(
+                    memory,
+                    allies_path=allies_path,
+                ).choose_actions(turn)
+            finally:
+                _s.DEVELOP_ALLY_SUPPORT_ENABLED = original
+            self.assertFalse(
+                any("ally_support" in item for item in summary.decisions),
+                f"满血盟友 Core 不应触发支援, 实际: {summary.decisions}",
+            )
+
     def test_develop_mode_switches_to_beacon_after_expedition_is_complete(self) -> None:
         turn, _ = make_turn(
             own_core=core((0, 0)),
