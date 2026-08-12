@@ -59,6 +59,10 @@ DEVELOP_EARLY_BEACON_MIN_RANGERS = 2
 # switching to beacon mode.  The reserve itself never leaves the Core.
 DEVELOP_BEACON_EXPEDITION_VANGUARDS = 1
 DEVELOP_BEACON_EXPEDITION_RANGERS = 2
+# 2026-08-12 用户战术：前期发育时发现附近（信标周围）不活跃的敌人 Core 就派
+# 战斗兵去摧毁（掠夺资源 + 拿信标），后期兵力壮大后才保留足够兵力守家。
+DEVELOP_CORE_RAID_MAX_BEACON_DISTANCE = 150  # 目标 core 距信标的搜索半径
+DEVELOP_CORE_RAID_HOME_RESERVE = 3  # 战斗兵总数超过该值时保留的守家数量
 DEVELOP_SEARCH_INITIAL_RADIUS = 10
 DEVELOP_SEARCH_STEP = 8
 # 侵略模式：4 工人维持经济，游侠占战斗编制多数。
@@ -3038,8 +3042,19 @@ class SmartTactic:
             or not self.memory.auto_migrate
             or self.memory.migration_site_checked
             or self.memory.mode == MODE_MIGRATE
-            or not any(unit.position == candidate for unit in turn.units)
         ):
+            return
+        # 2026-08-12: 放宽"必须有单位到达候选点"的硬门槛——超远富矿区（如
+        # chunk(1,-1) 采过 296 次，距 core 777 格）worker 长途侦察会原地打转，
+        # 永远无法到达候选点，迁移永不触发。改为：候选点有真实采集记录
+        # （chunk_harvests > 0）时即允许进入安全评估（攻击面检查仍严格执行）。
+        unit_at_candidate = any(
+            unit.position == candidate for unit in turn.units
+        )
+        candidate_has_resources = (
+            self.memory.chunk_harvests.get(_chunk_of(candidate), 0) > 0
+        )
+        if not unit_at_candidate and not candidate_has_resources:
             return
 
         obstacles = set(turn.obstacle_cells)
@@ -8108,6 +8123,76 @@ class SmartTactic:
             eligible_ids=home_vanguards - local_sortie_vanguards,
         )
 
+    def _choose_vanguards_develop_core_raid(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        acted_units: set[UUID],
+        decisions: list[str],
+    ) -> None:
+        """2026-08-12 用户战术：前期发育时发现附近不活跃的敌人 Core 就派兵摧毁。
+
+        只在 develop 模式启用。目标须在信标附近（敌人 Core 聚集区，掠夺资源 +
+        信标控制）；家被威胁/刚受伤时不派（自保优先）。前期兵少不守家全派，
+        后期战斗兵超过 DEVELOP_CORE_RAID_HOME_RESERVE 后保留守家数量。
+        """
+        core_target = self._pick_enemy_core_target(turn)
+        if (
+            core_target is None
+            or turn.core is None
+            or self._core_emergency_threats(turn)
+            or self._core_recently_damaged(turn)
+            or _distance(turn.beacon.position, core_target)
+            > DEVELOP_CORE_RAID_MAX_BEACON_DISTANCE
+        ):
+            return
+        combat = [unit for unit in turn.vanguards if unit.id not in acted_units]
+        combat += [unit for unit in turn.rangers if unit.id not in acted_units]
+        if not combat:
+            return
+        # 后期兵力充足时保留守家数量，其余去 raid；前期全派
+        raid_units = sorted(
+            combat,
+            key=lambda unit: (
+                str(unit.id) in self.memory.raid_vanguard_ids,
+                _distance(unit.position, core_target),
+                unit.id.bytes,
+            ),
+        )
+        if len(combat) > DEVELOP_CORE_RAID_HOME_RESERVE:
+            raid_units = raid_units[: len(raid_units) - DEVELOP_CORE_RAID_HOME_RESERVE]
+        for unit in raid_units:
+            if unit.id in acted_units:
+                continue
+            if isinstance(unit, Vanguard):
+                direction = self._sweep_targets(unit, turn, include_core=True)
+                if direction is not None:
+                    unit.sweep(direction)
+                    decisions.append(
+                        f"vanguard:{_short_id(unit.id)} sweep {direction.value} "
+                        "reason=enemy_core_raid"
+                    )
+                    self.memory.decision_totals["vanguard:enemy_core_assault"] += 1
+                    acted_units.add(unit.id)
+                    continue
+                if planner.toward(unit, core_target, "enemy_core_assault"):
+                    decisions.append(
+                        f"vanguard:{_short_id(unit.id)} enemy_core_assault "
+                        f"target={core_target}"
+                    )
+                    self.memory.decision_totals["vanguard:enemy_core_assault"] += 1
+                    acted_units.add(unit.id)
+            elif isinstance(unit, Ranger):
+                if self._ranger_shot_candidates(turn, unit, planner):
+                    continue
+                if planner.toward(unit, core_target, "enemy_core_assault"):
+                    decisions.append(
+                        f"ranger:{_short_id(unit.id)} enemy_core_assault "
+                        f"target={core_target}"
+                    )
+                    self.memory.decision_totals["ranger:enemy_core_assault"] += 1
+                    acted_units.add(unit.id)
+
     def _choose_vanguards_develop(
         self,
         turn: Turn,
@@ -8115,6 +8200,9 @@ class SmartTactic:
         acted_units: set[UUID],
         decisions: list[str],
     ) -> None:
+        self._choose_vanguards_develop_core_raid(
+            turn, planner, acted_units, decisions
+        )
         scout_vanguards, _ = self._develop_beacon_scout_ids(turn)
         for vanguard in sorted(turn.vanguards, key=_uuid_key):
             if vanguard.id not in scout_vanguards or vanguard.id in acted_units:

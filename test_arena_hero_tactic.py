@@ -1229,6 +1229,56 @@ class BalancedTacticTests(unittest.TestCase):
         self.assertIsInstance(turn.plan.core_action, SpawnAction)
         self.assertEqual(turn.plan.core_action.unit_type, UnitType.VANGUARD)
 
+    def test_develop_mode_raids_nearby_enemy_core(self) -> None:
+        """2026-08-12 用户战术：develop 模式发现信标附近敌人 core 时派先锋摧毁。"""
+        target = (30, 10)  # 距 beacon(0,0) 40 格（≤150）
+        turn, _ = make_turn(
+            own_core=core((0, 0)),
+            units=(
+                vanguard((1, 0), VANGUARD_ID),
+                vanguard((2, 0), VANGUARD_TWO_ID),
+            ),
+            enemies=(enemy_core(target),),
+            beacon=ChampionBeacon(position=(0, 0)),
+        )
+
+        memory = TacticMemory(mode=MODE_DEVELOP)
+        summary = SmartTactic(memory).choose_actions(turn)
+
+        # 至少一个先锋被派去攻击敌人 core
+        self.assertTrue(
+            any("enemy_core_assault" in item for item in summary.decisions),
+            f"应有 enemy_core_assault 决策, 实际: {summary.decisions}",
+        )
+        # 有先锋向目标移动
+        self.assertTrue(
+            any(
+                isinstance(action, MoveAction)
+                for action in turn.plan.unit_actions.values()
+            )
+        )
+
+    def test_develop_mode_does_not_raid_distant_enemy_core(self) -> None:
+        """敌人 core 距信标超 150 格时不派兵（避免长途送死）。"""
+        target = (200, 0)  # 距 beacon 200 格（>150）
+        turn, _ = make_turn(
+            own_core=core((0, 0)),
+            units=(
+                vanguard((1, 0), VANGUARD_ID),
+                vanguard((2, 0), VANGUARD_TWO_ID),
+            ),
+            enemies=(enemy_core(target),),
+            beacon=ChampionBeacon(position=(0, 0)),
+        )
+
+        memory = TacticMemory(mode=MODE_DEVELOP)
+        summary = SmartTactic(memory).choose_actions(turn)
+
+        self.assertFalse(
+            any("enemy_core_assault" in item for item in summary.decisions),
+            f"不应有 enemy_core_assault 决策, 实际: {summary.decisions}",
+        )
+
     def test_develop_mode_switches_to_beacon_after_expedition_is_complete(self) -> None:
         turn, _ = make_turn(
             own_core=core((0, 0)),
