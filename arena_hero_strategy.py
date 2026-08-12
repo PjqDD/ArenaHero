@@ -139,11 +139,11 @@ POST_RECALL_SWEEP_READY_DENOMINATOR = 5
 # 2026-08-11: 视野内无资源时持续螺旋外扩。原 28 导致 core 周围荒漠时工人空转；
 # 160 让工人能逐圈推进到 160 格，触达最近真实富矿区。
 DEVELOP_WIDE_SEARCH_MAX_RADIUS = 160
-# 2026-08-11: develop_local_recall 的"当地范围"判定与探索半径解耦。
-# 初设 28，但 core 附近真实资源锚点可达 31-38 格，28 会把手持/临近采集目标的
-# worker 拉回 core，导致到不了采集点空转。放宽到 48：覆盖近端锚点（31-38）有余量，
-# 同时仍把 >48 格的失控远端 worker 召回 core，保留召回保护。
-DEVELOP_LOCAL_RECALL_RADIUS = 48
+# 2026-08-12: develop_local_recall 的"当地范围"判定与探索半径解耦。
+# 初设 28，后放宽 48；核心迁至 (137,-98) 后附近富矿锚点（chunk(5,-5) 采过 135 次
+# 等）多在 48-100 格外，48 会把去富矿的工人拉回 core 导致采集停滞。
+# 放宽到 120：覆盖核心周围主要富矿锚点，同时仍把 >120 格的失控远端 worker 召回。
+DEVELOP_LOCAL_RECALL_RADIUS = 120
 # A visible resource can still be a poor economic target when it was revealed
 # by a distant scout.  Keep new Develop-mode assignments inside the same local
 # production radius unless a Worker is already close enough to finish it.
