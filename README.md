@@ -30,7 +30,9 @@
 
 ## Windows 快速开始
 
-在 PowerShell 中运行：
+直接双击根目录的 `start.bat` 即可一键启动。首次启动会自动安装依赖并提示输入 API Key，之后会直接复用已有配置。
+
+也可以在 PowerShell 中分步运行：
 
 ```powershell
 .\setup.ps1
